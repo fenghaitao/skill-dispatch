@@ -8,7 +8,7 @@ DESIGN = README.parent / "docs/design.md"
 
 def test_readme_documents_git_identity_session_history_and_skill_visibility():
     text = README.read_text()
-    assert "repo_commit" in text and "skill_blob" in text
+    assert "repo_commit" in text and "skill_repo_path" in text
     assert "backend process/session identifies the execution" in text
     assert "There is no dispatcher receipt, synthetic run ID, or verify command" in text
     assert "A parent-folder Claude session does not initially load" in text
