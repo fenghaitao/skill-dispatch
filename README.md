@@ -2,8 +2,9 @@
 
 A small prototype of an orchestrator that discovers the skills of several
 folders and dispatches work to an agent in the right folder. The worker finds
-the skill in its own folder. Discovery, routing and dispatch read only frontmatter;
-verification intentionally reads skill bodies to check receipt tokens.
+the skill in its own folder. Discovery and routing parse only frontmatter.
+Dispatch records the selected skill's committed Git identity without interpreting
+its body, so existing skills need no skill-dispatch-specific instructions.
 
 ```
 skill-dispatch/
@@ -20,15 +21,16 @@ skill-dispatch/
 
 1. **Discover.** Scan each folder for `.claude/skills/*/SKILL.md` and read only
    the frontmatter (`name`, `description`) into a catalog. The skill body is
-   never read here. YAML frontmatter is limited to 16 KiB, parsed safely, and
+   never parsed here. YAML frontmatter is limited to 16 KiB, parsed safely, and
    duplicate keys are rejected. Names must be lowercase letters or digits in
    words separated by hyphens, at most 64 characters. Receipt paths must stay
    inside the workspace's `.skill-receipts/` directory, including through symlinks.
 2. **Route.** Pick the skill for a task: the one named with `--skill`, or the
    best word overlap between the task and the skills' names and descriptions.
    No match, or a tie, asks for `--skill`.
-3. **Dispatch.** Start a worker with the chosen folder as its working
-   directory and tell it which skill to use:
+3. **Dispatch.** Require the selected `SKILL.md` to be tracked and clean in Git,
+   record the current repository commit and that file's Git blob ID, then start a
+   worker with the chosen folder as its working directory and tell it which skill to use:
    - `print`: show the plan only;
    - `local`: `claude -p` as a subprocess in the folder;
    - `orca`: register the folder with Orca, open a terminal there, start
@@ -36,15 +38,16 @@ skill-dispatch/
    - `herdr`: create a background tab in the caller's Herdr workspace with
      the selected folder as its cwd, start a named Claude worker through
      `herdr agent start`, then submit the task with `herdr agent prompt`.
-4. **Verify.** Each demo skill tells the worker to atomically write
-   `.skill-receipts/<skill>.json` with its skill name, a token from the skill
-   body, the absolute working directory, and the dispatch ID supplied in the
-   prompt. The separate `verify` command intentionally reads skill bodies to
-   check tokens. It requires `--dispatch-id ID` and fails for missing, invalid,
-   stale or mismatched receipts. It checks every discovered skill by default;
-   repeat `--skill NAME` to require only the skills dispatched in that run.
-   Receipts provide evidence that instructions were followed; they do not
-   prove that the requested work is correct or complete.
+4. **Verify.** The dispatcher prompt, not the skill, tells the worker to atomically
+   write `.skill-receipts/<skill>.json` with the skill name, absolute working
+   directory, dispatch ID, repository commit and selected skill blob. The
+   `verify` command checks that the recorded commit contains that blob and that
+   the current `SKILL.md` still matches the same committed version. It requires
+   `--dispatch-id ID` and fails for missing, invalid, stale or mismatched receipts.
+   It checks every discovered skill by default; repeat `--skill NAME` to require
+   only the skills dispatched in that run. Receipts provide evidence that the
+   current dispatch reached its completion marker; they do not prove that the
+   requested work is correct or complete.
 
 ## Usage
 
@@ -97,13 +100,23 @@ chosen deliberately. A working directory is not a filesystem sandbox; use a
 container or other isolation when workers must not access other folders.
 The dispatcher never answers a trust prompt, including with either opt-in flag.
 
-## Receipt IDs and waiting
+## Git identity, dispatch IDs and waiting
+
+Each dispatch records two different kinds of identity. `repo_commit` plus
+`skill_blob` identify the committed skill definition. `dispatch_id` identifies
+one execution attempt. They are intentionally not interchangeable: many tasks can
+run against the same pinned submodule commit and the same skill blob.
 
 Dispatch generates a fresh ID if `--dispatch-id` is omitted and includes it in
 the JSON plan and worker prompt. Use a unique ID for each run; never reuse an ID
 for a different task in the same workspace. Record the generated ID, or supply
-your own unique ID when coordinating dispatch and verification.
-Legacy receipts without a dispatch ID fail validation.
+your own unique ID when coordinating dispatch and verification. Receipts without
+the Git identity fields or dispatch ID fail validation.
+
+The selected skill must be tracked and have no staged or unstaged changes when
+dispatch starts. This is a narrow consistency check on `SKILL.md`; other task
+files may be dirty or may change while the worker runs. Git submodules fit this
+model naturally because the submodule checkout already provides a pinned commit.
 
 Local dispatch always checks for a complete receipt for the current dispatch
 after the synchronous worker returns. A zero worker exit with a missing or
@@ -111,8 +124,9 @@ invalid receipt makes dispatch exit nonzero. `--wait` allows extra waiting for
 a successful worker's receipt; a failed worker does not trigger extra waiting.
 
 `--wait SECONDS` waits for complete receipt JSON with the selected skill, absolute
-folder and current dispatch ID. Waiting does not read skill bodies or check the
-secret token; run `verify` afterward to check the token. An Orca send acknowledgement
+folder, current dispatch ID, and the exact commit/blob identity captured before
+launch. Waiting does not parse skill bodies; run `verify` afterward to confirm
+that Git still resolves the receipt to the same skill content. An Orca send acknowledgement
 proves input acceptance, not a started turn. Herdr additionally requires observed
 worker activity after submission. Orca delivery metadata and warnings and Herdr
 prompt responses are retained in the output. Readiness and receipt wait
@@ -170,7 +184,7 @@ after a positive readiness result and never answers the trust prompt. Local
 dispatch uses noninteractive `claude -p` with stdin disabled.
 
 The test suite mocks worker subprocesses and Orca/Herdr responses, including permissions,
-folder selection, trust waits, timeouts, send acknowledgements and receipt checks.
+folder selection, trust waits, timeouts, send acknowledgements, Git skill identity and receipt checks.
 It runs the real dispatcher demo with the print backend and checks Herdr demo
 arguments with a stub dispatcher. These tests do not establish
 that a live Claude/Orca/Herdr installation starts workers or completes the example tasks.
