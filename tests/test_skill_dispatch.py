@@ -238,3 +238,18 @@ def test_folder_names_do_not_affect_routing_or_ties(tmp_path):
     assert sd.route(catalog, "widgets")["skill"]["name"] == "alpha"
     with pytest.raises(sd.DispatchError, match="equally"):
         sd.route(catalog, "parse")
+
+
+def test_header_limit_cannot_turn_a_truncated_prefix_into_a_delimiter(tmp_path, monkeypatch):
+    path = tmp_path / "SKILL.md"
+    header = b"---\nname: alpha\ndescription: widgets\n"
+    path.write_bytes(header + b"---not-a-delimiter\nbody")
+    monkeypatch.setattr(sd, "MAX_FRONTMATTER_BYTES", len(header) + 3)
+    with pytest.raises(sd.DispatchError, match="exceeds"):
+        sd.frontmatter(path)
+
+
+def test_header_closing_delimiter_at_eof_is_accepted_below_limit(tmp_path):
+    path = tmp_path / "SKILL.md"
+    path.write_bytes(b"---\nname: alpha\ndescription: widgets\n---")
+    assert sd.frontmatter(path) == {"name": "alpha", "description": "widgets"}

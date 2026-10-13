@@ -93,7 +93,10 @@ def frontmatter(path: Path) -> dict:
             if not line:
                 raise DispatchError(f"{path}: frontmatter is not closed")
             used += len(line)
-            if line.rstrip(b"\r\n") == b"---":
+            # At the byte limit a newline-free prefix may actually be part of
+            # a longer line (e.g. ---not-a-delimiter). Do not accept that prefix.
+            complete_line = line.endswith(b"\n") or used < MAX_FRONTMATTER_BYTES
+            if complete_line and line.rstrip(b"\r\n") == b"---":
                 break
             header.extend(line)
         else:
