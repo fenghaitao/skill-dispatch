@@ -20,7 +20,7 @@ def demo_env(tmp_path):
     git = binaries / "git"
     git.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$GIT_CALLS"\n')
     git.chmod(0o755)
-    for name in ("claude", "orca", "orca-ide"):
+    for name in ("claude", "orca", "orca-ide", "herdr"):
         worker = binaries / name
         worker.write_text('#!/usr/bin/env bash\necho unexpected-worker >> "$WORKER_CALLS"\nexit 99\n')
         worker.chmod(0o755)
@@ -29,7 +29,7 @@ def demo_env(tmp_path):
 
 
 def run_demo(env, *args):
-    assert args[0] not in {"local", "orca"}, "demo tests must never dispatch a live backend"
+    assert args[0] not in {"local", "orca", "herdr"}, "demo tests must never dispatch a live backend"
     result = subprocess.run(["bash", str(SCRIPT), *map(str, args)], cwd=REPO, env=env,
                             capture_output=True, text=True, timeout=30)
     assert not Path(env["WORKER_CALLS"]).exists(), "print demo attempted to launch a worker"
@@ -158,3 +158,33 @@ def test_demo_default_scratch_uses_a_fresh_temporary_directory(tmp_path, demo_en
     plans = print_plans(result.stdout)
     scratch = Path(plans[0]["folder"]).parent
     assert scratch.parent == tmp_path and scratch.name.startswith("skill-dispatch-demo.")
+
+
+def test_herdr_demo_waits_for_each_dispatch_before_verification(tmp_path, demo_env):
+    # Stub only the dispatcher entrypoint; keep scratch setup and CLI assembly real.
+    wrapper = tmp_path / 'python-dispatch-stub'
+    calls = tmp_path / 'dispatch-calls.jsonl'
+    wrapper.write_text(
+        f'#!{sys.executable}\n'
+        'import json, os, subprocess, sys\n'
+        'from pathlib import Path\n'
+        'if Path(sys.argv[1]).name == "skill_dispatch.py":\n'
+        '    with open(os.environ["DISPATCH_CALLS"], "a") as f:\n'
+        '        f.write(json.dumps(sys.argv[2:]) + "\\n")\n'
+        'else:\n'
+        '    sys.exit(subprocess.run([sys.executable, *sys.argv[1:]]).returncode)\n')
+    wrapper.chmod(0o755)
+    env = {**demo_env, 'PYTHON': str(wrapper), 'DISPATCH_CALLS': str(calls)}
+    result = subprocess.run(['bash', str(SCRIPT), 'herdr', str(tmp_path / 'scratch'),
+                             '--accept-edits', '--allow-tool', 'Bash(python3 -m pytest -q)'],
+                            cwd=REPO, env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert not Path(env['WORKER_CALLS']).exists()
+    commands = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert [command[0] for command in commands] == ['dispatch'] * 3 + ['verify']
+    for command in commands[:3]:
+        assert command[command.index('--backend') + 1] == 'herdr'
+        assert command[command.index('--wait') + 1] == '600'
+        assert '--accept-edits' in command
+        assert '--allow-tool=Bash(python3 -m pytest -q)' in command
+    assert len({command[command.index('--dispatch-id') + 1] for command in commands}) == 1

@@ -9,7 +9,7 @@ The separate verify command intentionally reads skill bodies to check tokens.
     skill_dispatch.py discover --root <dir>
     skill_dispatch.py route    --root <dir> --task "..." [--skill NAME]
     skill_dispatch.py dispatch --root <dir> --task "..." [--skill NAME]
-                               [--backend print|local|orca] [--model M] [--wait SECONDS]
+                               [--backend print|local|orca|herdr] [--model M] [--wait SECONDS]
     skill_dispatch.py verify   --root <dir> --dispatch-id ID [--skill NAME ...]
 
 Backends:
@@ -18,6 +18,8 @@ Backends:
   orca   open an Orca terminal in the folder, start `claude` there and send the task.
          A trust prompt for a new folder is left to a person; the dispatcher
          names the waiting tab and sends the task once the agent is ready.
+  herdr  open a background tab in the caller's Herdr workspace and start Claude
+         through the agent API; wait for readiness before submitting the task.
 
 A skill may ask the worker to write `.skill-receipts/<skill>.json` holding a
 token that appears only in the skill's body. Dispatch supplies a dispatch ID;
@@ -30,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import shlex
 import subprocess
@@ -320,6 +323,128 @@ def dispatch_local(folder: Path, prompt: str, model: str | None, *,
             "output": (result.stdout or result.stderr).strip()[-2000:]}
 
 
+class HerdrError(DispatchError):
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code
+
+
+def _herdr(*args: str, timeout: float = 30) -> dict:
+    """Herdr emits success JSON on stdout and server error JSON on stderr."""
+    result = _run(["herdr", *args], timeout=timeout)
+    output = (result.stderr or result.stdout) if result.returncode else result.stdout
+    try:
+        payload = json.loads(output)
+    except ValueError as exc:
+        raise HerdrError(f"herdr {' '.join(args[:2])}: {output.strip() or 'empty response'}") from exc
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if result.returncode or error is not None:
+        code = error.get("code") if isinstance(error, dict) else None
+        raise HerdrError(f"herdr {' '.join(args[:2])}: {error or f'exit {result.returncode}'}", code)
+    value = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(value, dict):
+        raise HerdrError(f"herdr {' '.join(args[:2])}: invalid result")
+    return value
+
+
+def dispatch_herdr(folder: Path, prompt: str, title: str, model: str | None,
+                   ready_seconds: float = 600, *, accept_edits: bool = False,
+                   allow_tools: list[str] | None = None) -> dict:
+    """Create one background tab per task; never answer a blocked worker's UI."""
+    validate_seconds(ready_seconds)
+    workspace = os.environ.get("HERDR_WORKSPACE_ID")
+    if os.environ.get("HERDR_ENV") != "1" or not workspace:
+        raise DispatchError("herdr backend requires a Herdr terminal with HERDR_ENV=1 "
+                            "and HERDR_WORKSPACE_ID")
+    deadline = time.monotonic() + ready_seconds
+
+    def remaining(minimum: float = 0.001) -> float:
+        budget = deadline - time.monotonic()
+        if budget < minimum:
+            raise DispatchError("Herdr readiness budget expired; task not sent")
+        return budget
+
+    # Herdr 0.8 requires agent-start timeouts in 3001..300000 milliseconds.
+    remaining(3.001)
+    created = _herdr("tab", "create", "--workspace", workspace,
+                     "--cwd", str(folder.resolve()), "--label", title,
+                     "--no-focus", timeout=min(30, remaining()))
+    root_pane = created.get("root_pane")
+    created_tab = created.get("tab")
+    pane = root_pane.get("pane_id") if isinstance(root_pane, dict) else None
+    tab = created_tab.get("tab_id") if isinstance(created_tab, dict) else None
+    if not isinstance(pane, str) or not pane or not isinstance(tab, str) or not tab:
+        raise DispatchError("Herdr tab create returned no tab or root pane")
+    name = f"sd-{uuid.uuid4().hex[:20]}"
+    argv = permission_args(accept_edits, allow_tools)
+    if model:
+        argv += [f"--model={model}"]
+    try:
+        resumed_startup = False
+        while True:
+            budget = remaining(3.001)
+            try:
+                started = _herdr("agent", "start", name, "--kind", "claude", "--pane", pane,
+                                 "--timeout", str(min(300000, int(budget * 1000))), "--", *argv,
+                                 timeout=budget)
+                break
+            except HerdrError as exc:
+                if exc.code == "agent_pane_busy":
+                    # A new tab can be returned before its shell is at a prompt.
+                    # This explicit rejection starts nothing, so retry only it.
+                    time.sleep(min(0.1, remaining()))
+                    continue
+                if exc.code != "agent_not_ready":
+                    raise
+                # A blocked startup preserves the named agent. Observe it until a
+                # person resolves the prompt; never restart it or send UI input.
+                print(f"waiting: Herdr tab {title!r} ({tab}), pane {pane}, agent {name} "
+                      "is blocked during startup; answer it there", file=sys.stderr, flush=True)
+                resumed_startup = True
+                started = _herdr("agent", "get", name, timeout=min(30, remaining()))
+                break
+        ready_since = None
+        while True:
+            remaining()
+            agent = started.get("agent")
+            if (not isinstance(agent, dict) or agent.get("pane_id") != pane
+                    or agent.get("agent") != "claude" or agent.get("name") != name):
+                raise DispatchError("Herdr returned a different or missing worker; task not sent")
+            if (agent.get("agent_status") in {"idle", "done"}
+                    and agent.get("interactive_ready") is True
+                    and not agent.get("launch_pending", False)):
+                if ready_since is None:
+                    ready_since = time.monotonic()
+                # After a trust dialog, an initial ready screen can be replaced
+                # by Claude's startup UI. Require sustained readiness before
+                # submitting input.
+                if not resumed_startup or time.monotonic() - ready_since >= 3:
+                    break
+            else:
+                ready_since = None
+            time.sleep(min(0.1, remaining()))
+            started = _herdr("agent", "get", name, timeout=min(30, remaining()))
+        remaining()
+        # Wait only for observed activity, including a turn that completes
+        # quickly. Herdr's prompt activity gate rejects an unchanged idle UI.
+        sent = _herdr("agent", "prompt", name, prompt, "--wait",
+                      "--until", "working", "--until", "blocked",
+                      "--until", "idle", "--until", "done", "--timeout", "10000",
+                      timeout=15)
+        agent = sent.get("agent")
+        if (sent.get("type") != "agent_prompted" or not isinstance(agent, dict)
+                or agent.get("pane_id") != pane or agent.get("name") != name
+                or agent.get("agent") != "claude"):
+            raise DispatchError("Herdr did not acknowledge the task for the expected worker")
+        if agent.get("agent_status") not in {"working", "idle", "done"}:
+            raise DispatchError("Herdr worker blocked after submission; inspect its prompt")
+    except (DispatchError, OSError, subprocess.SubprocessError) as exc:
+        raise DispatchError(f"Herdr tab {tab}, pane {pane}, agent {name}: {exc}. "
+                            "Inspect this worker before retrying; it has been left open.") from exc
+    return {"backend": "herdr", "workspace": workspace, "tab": tab, "pane": pane,
+            "agent": name, "accepted": True, "activity_observed": True, "send": sent}
+
+
 def wait_for_receipt(folder: Path, skill: str, dispatch_id: str, seconds: float) -> bool:
     """Wait for a complete receipt for this dispatch without reading skill bodies."""
     validate_dispatch_id(dispatch_id)
@@ -429,7 +554,7 @@ def main(argv: list[str] | None = None) -> int:
         if name == "verify":
             p.add_argument("--skill", action="append", help="require receipts only for these skills; repeatable")
         if name == "dispatch":
-            p.add_argument("--backend", choices=("print", "local", "orca"), default="print")
+            p.add_argument("--backend", choices=("print", "local", "orca", "herdr"), default="print")
             p.add_argument("--model")
             p.add_argument("--accept-edits", action="store_true",
                            help="opt in to automatic approval of in-scope edits")
@@ -438,7 +563,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--wait", type=seconds_argument, default=0,
                            help="seconds to wait for a complete receipt for this dispatch")
             p.add_argument("--ready", type=seconds_argument, default=600,
-                           help="seconds to wait for the worker to be ready (orca backend)")
+                           help="seconds to wait for the worker to be ready (orca/herdr backends)")
     args = parser.parse_args(argv)
     try:
         if args.command == "discover":
@@ -463,9 +588,10 @@ def main(argv: list[str] | None = None) -> int:
             plan.update(dispatch_local(folder, plan["prompt"], args.model,
                                        accept_edits=args.accept_edits, allow_tools=args.allow_tool))
         else:
-            plan.update(dispatch_orca(folder, plan["prompt"], f"{skill} worker", args.model,
-                                      args.ready, accept_edits=args.accept_edits,
-                                      allow_tools=args.allow_tool))
+            dispatch = dispatch_herdr if args.backend == "herdr" else dispatch_orca
+            plan.update(dispatch(folder, plan["prompt"], f"{skill} worker", args.model,
+                                 args.ready, accept_edits=args.accept_edits,
+                                 allow_tools=args.allow_tool))
         # Local workers have finished when subprocess.run returns. A zero
         # worker exit alone does not mean it performed any authorized work.
         if args.backend == "local" or args.wait:

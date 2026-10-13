@@ -33,8 +33,8 @@ def test_demo_skill_commands_are_covered_by_documented_allow_rules():
                         re.findall(r"\brun\s+`([^`]+)`", skill.read_text(), re.IGNORECASE))
     assert commands, "no runnable commands found in demo skills"
     demos = [shlex.split(line) for line in README.read_text().splitlines()
-             if line.startswith(("scripts/demo.sh local ", "scripts/demo.sh orca "))]
-    assert {args[1] for args in demos} == {"local", "orca"}
+             if line.startswith(("scripts/demo.sh local ", "scripts/demo.sh orca ", "scripts/demo.sh herdr "))]
+    assert {args[1] for args in demos} == {"local", "orca", "herdr"}
     for args in demos:
         rules = [args[index + 1] for index, value in enumerate(args) if value == "--allow-tool"]
         for skill, command in commands:

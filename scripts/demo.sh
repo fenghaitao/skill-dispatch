@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Copy workspaces into fresh scratch repositories and dispatch one task to each.
-# Usage: scripts/demo.sh [local|orca|print] [new-scratch-dir]
+# Usage: scripts/demo.sh [local|orca|herdr|print] [new-scratch-dir]
 #                       [--accept-edits] [--allow-tool RULE ...]
 set -euo pipefail
 backend="${1:-print}"
 case "$backend" in
-    local|orca|print) ;;
+    local|orca|herdr|print) ;;
     *) echo "invalid backend: $backend" >&2; exit 2 ;;
 esac
 if [ "$#" -gt 0 ]; then shift; fi
@@ -71,7 +71,7 @@ tasks=(
 for task in "${tasks[@]}"; do
     args=(dispatch --root "$scratch" --task "$task" --backend "$backend" --dispatch-id "$run_id")
     [ -n "$model" ] && args+=("--model=$model")
-    [ "$backend" = orca ] && args+=(--wait 600)
+    if [ "$backend" = orca ] || [ "$backend" = herdr ]; then args+=(--wait 600); fi
     args+=("${dispatch_options[@]}")
     "$python" "$here/orchestrator/skill_dispatch.py" "${args[@]}"
 done

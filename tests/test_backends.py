@@ -244,7 +244,7 @@ def test_orca_zero_readiness_budget_starts_nothing(monkeypatch, tmp_path):
         sd.dispatch_orca(tmp_path, "task", "worker", None, 0)
 
 
-@pytest.mark.parametrize("backend", ["local", "orca"])
+@pytest.mark.parametrize("backend", ["local", "orca", "herdr"])
 def test_main_forwards_explicit_permission_opt_ins(monkeypatch, capsys, backend):
     def dispatch(folder, prompt, *args, **kwargs):
         assert folder == (WORKSPACES / "data-tools").resolve()
