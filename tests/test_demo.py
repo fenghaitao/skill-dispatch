@@ -131,7 +131,7 @@ def test_demo_print_copies_hidden_skills_and_records_git_identity(tmp_path, demo
     for relative, content in before.items():
         assert (scratch / Path(relative).relative_to("workspaces")).read_bytes() == content
     assert sources() == before
-    assert len(Path(demo_env["GIT_CALLS"]).read_text().splitlines()) == 24
+    assert len(Path(demo_env["GIT_CALLS"]).read_text().splitlines()) == 21
 
 
 def test_demo_default_scratch_uses_a_fresh_temporary_directory(tmp_path, demo_env):
