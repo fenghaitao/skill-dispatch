@@ -78,14 +78,9 @@ Before starting a worker:
 2. require the selected `SKILL.md` to be tracked;
 3. require that skill file to have no staged or unstaged changes;
 4. record `HEAD`;
-5. record the blob ID of the selected `SKILL.md` at `HEAD`.
+5. record the repository-relative path of the selected `SKILL.md`.
 
-These values describe the instructions selected for the run:
-
-```text
-repo_commit = repository snapshot
-skill_blob  = exact selected skill contents
-```
+The submodule commit plus that path identifies the exact skill contents selected for the run.
 
 Other files in the workspace may be dirty. The worker is expected to modify
 workspace files as part of the task.
@@ -109,7 +104,7 @@ history, prompts, activity, output, and status.
 Git identity and execution identity answer different questions:
 
 ```text
-Git:      what skill/code snapshot was selected?
+Git:      what workspace/skill snapshot was selected?
 Session:  what happened when the agent ran?
 ```
 
