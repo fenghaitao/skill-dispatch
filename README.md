@@ -55,8 +55,9 @@ repository (a sub-repo), so runs never change this repository.
 - A Claude Code session started in the folder that holds the sub-repos sees
   none of their skills; a session started inside `calc-lib` sees
   `add-calc-function`. Skills follow the working directory.
-- With the `local` backend, all three workers wrote receipts with the right
-  token and folder.
+- With both the `local` and the `orca` backend, all three workers wrote
+  receipts with the right token and folder, and did the work in their own
+  sub-repo (calc.py and its test, the 0.2.0 changelog entry, the sales report).
 - A folder Claude Code has not been told to trust opens with a trust prompt.
   The `orca` backend leaves that to a person: it names the waiting tab and
   sends the task once the agent is ready. `claude -p` does not prompt.
