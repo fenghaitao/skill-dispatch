@@ -41,8 +41,12 @@ skill-dispatch/
    - `print`: show the plan only;
    - `local`: run `claude -p` synchronously;
    - `orca`: create an Orca terminal, wait for Claude readiness, then send the task;
-   - `herdr`: create a background tab, start a named Claude agent, wait for
+   - `herdr`: create a background tab, start a named agent, wait for
      readiness, then submit the task.
+
+   `--agent` picks the worker CLI: `claude` (Claude Code, the default) or
+   `copilot` (GitHub Copilot CLI) for the `local` and `herdr` backends; see
+   [GitHub Copilot workers](#github-copilot-workers).
 
 There is no dispatcher receipt, synthetic run ID, or verify command. Execution
 state and history belong to the backend session/process. Git identity answers
@@ -70,6 +74,10 @@ scripts/demo.sh orca /tmp/sd-orca --accept-edits \
   --allow-tool 'Bash(python3 -m pytest -q)'
 scripts/demo.sh herdr /tmp/sd-herdr --accept-edits \
   --allow-tool 'Bash(python3 -m pytest -q)'
+AGENT=copilot scripts/demo.sh local /tmp/sd-copilot --accept-edits \
+  --allow-tool 'shell(python3)'
+AGENT=copilot scripts/demo.sh herdr /tmp/sd-copilot-herdr --accept-edits \
+  --allow-tool 'shell(python3)'
 
 uv run pytest -q tests
 ```
@@ -122,6 +130,8 @@ owns.
 
 All worker backends start Claude with `--permission-mode dontAsk` by default.
 Operations that need approval are denied unless existing rules allow them.
+Copilot workers get the equivalent rules described under
+[GitHub Copilot workers](#github-copilot-workers).
 
 Use `--accept-edits` to opt into `acceptEdits`. Use repeatable
 `--allow-tool RULE` options for specific tool rules, for example:
@@ -144,7 +154,7 @@ after prompt submission, which confirms that the backend accepted and started
 processing the turn; it is not a claim that the requested task is correct.
 
 Run the Herdr backend from a Herdr-managed terminal with `HERDR_ENV=1` and
-`HERDR_WORKSPACE_ID` available:
+`HERDR_WORKSPACE_ID` available, plus the worker CLI (`claude` or `copilot`):
 
 ```bash
 python3 orchestrator/skill_dispatch.py dispatch --root workspaces \
@@ -153,6 +163,60 @@ python3 orchestrator/skill_dispatch.py dispatch --root workspaces \
 
 Successful Herdr workers remain open so their output/history can be inspected
 with Herdr's agent/session commands.
+
+## Herdr launch check
+
+Herdr types the worker command into the tab's interactive shell, so a shell alias
+or wrapper can add options, for example `alias copilot='copilot --allow-all'`.
+Before submitting, dispatch reads the pane's foreground processes with
+`herdr pane process-info` and requires the worker to run with exactly the
+requested options. Otherwise it reports what it found and leaves the tab open
+without sending the task. Remove or rename such an alias to use the backend.
+The check was validated with Herdr 0.9.3 (protocol 22) for Claude and Copilot
+workers.
+
+Herdr's prompt gate requires the worker to start within five seconds of
+accepting input. A worker can be slower, for example Copilot reloading MCP
+servers after a trust prompt. After `agent_prompt_stalled`, dispatch keeps
+observing for up to 60 seconds without resubmitting and accepts `working`, or
+`done` with an advanced `state_change_seq`.
+
+## GitHub Copilot workers
+
+`--agent copilot` starts [GitHub Copilot CLI](https://docs.github.com/copilot)
+instead of Claude Code. Copilot loads project skills from `.claude/skills/`
+as well as `.github/skills/`, so the workspaces need no changes. Copilot must be
+installed and signed in (`copilot login`).
+
+- `local` runs `copilot -p PROMPT -s` in the folder with stdin disabled.
+- `herdr` starts the worker with `herdr agent start --kind copilot` and then
+  follows the same readiness, launch-check and submission steps as Claude.
+- `orca` rejects `--agent copilot` for now.
+
+Every Copilot worker gets `--no-ask-user` and no blanket approvals: under `-p`,
+Copilot denies writes and commands that no rule allows, and an interactive
+worker prompts for them. The permission options map as follows:
+
+| Option | Claude Code | Copilot CLI |
+| --- | --- | --- |
+| default | `--permission-mode dontAsk` | no `--allow-tool` rules |
+| `--accept-edits` | `--permission-mode acceptEdits` | `--allow-tool=write`, `shell(mkdir)`, `shell(mv)` |
+| `--allow-tool RULE` | `--allowedTools=RULE,...` | one `--allow-tool=RULE` per rule |
+
+`shell(mkdir)` and `shell(mv)` approximate the common filesystem commands that
+Claude's `acceptEdits` allows. Copilot approves `shell(...)` rules by command
+name, not by path, so these rules are not a filesystem sandbox.
+Rules use the agent's own syntax. Copilot rules such as `shell(python3)`,
+`shell(git:*)` or `url(github.com)` are passed through unchanged. Claude rules
+such as `Bash(...)` or `Edit` are rejected for Copilot before anything starts.
+Copilot matches shell rules on the command name, not the full command line:
+`shell(python3)` approves every `python3` command, which is broader than
+`Bash(python3 -m pytest -q)`. Use `--model` to pick a Copilot model.
+
+The dispatcher controls only Copilot's command line. The `COPILOT_ALLOW_ALL`
+environment variable and the `defaultPermissionMode` and `defaultMode` settings
+in `~/.copilot/settings.json` can still widen approvals, and the Herdr launch
+check cannot see them. Leave them unset for conservative workers.
 
 ## Skill visibility
 
@@ -168,6 +232,7 @@ isolation boundary.
 ## Tests
 
 The test suite covers frontmatter safety, routing, Git identity, permission
-arguments, Orca/Herdr readiness and trust behavior, backend acknowledgements,
-and the demo's scratch-repository safety. Backend tests use mocks; they do not
-prove that a live Claude/Orca/Herdr installation will complete a task correctly.
+arguments for Claude and Copilot, Orca/Herdr readiness and trust behavior,
+the Herdr launch check, backend acknowledgements, and the demo's
+scratch-repository safety. Backend tests use mocks; they do not prove that a
+live Claude/Copilot/Orca/Herdr installation will complete a task correctly.

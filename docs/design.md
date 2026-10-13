@@ -124,13 +124,17 @@ tests, builds, generated artifacts, human review, or other acceptance checks.
 
 ## Backends
 
+Each backend starts a worker CLI chosen with `--agent`: Claude Code (default)
+or GitHub Copilot CLI, which also reads `.claude/skills`. Copilot is supported
+by the local and Herdr backends.
+
 ### print
 
 Return the routing plan and Git identity without starting an agent.
 
 ### local
 
-Run `claude -p` with the workspace as cwd. Process exit and captured output are
+Run `claude -p` (or `copilot -p`) with the workspace as cwd. Process exit and captured output are
 the lifecycle result.
 
 ### Orca
@@ -143,7 +147,9 @@ The returned terminal handle is the execution identity.
 ### Herdr
 
 Create a background tab in the inherited Herdr workspace, start a named Claude
-agent, wait for interactive readiness, then submit the task.
+or Copilot agent, wait for interactive readiness, check that the worker runs
+with exactly the requested options (a shell alias must not widen them), then
+submit the task.
 
 The returned workspace/tab/pane/agent fields are the execution identity and can
 be used to inspect the session later.
@@ -152,7 +158,8 @@ be used to inspect the session later.
 
 Routing to a workspace does not grant permissions.
 
-Workers start conservatively with `--permission-mode dontAsk`. Wider edit or
+Workers start conservatively with `--permission-mode dontAsk`, or for Copilot
+with no `--allow-tool` approvals. Wider edit or
 tool permissions require explicit CLI opt-ins. A cwd is not a security
 boundary; use OS/container isolation where needed.
 

@@ -11,7 +11,7 @@ def forbid_real_agents(monkeypatch):
 
     def guarded(argv, *args, **kwargs):
         executable = argv[0] if isinstance(argv, (list, tuple)) else argv.split()[0]
-        if Path(executable).name in {"claude", "orca", "orca-ide", "orca-dev", "herdr"}:
+        if Path(executable).name in {"claude", "copilot", "orca", "orca-ide", "orca-dev", "herdr"}:
             pytest.fail(f"test attempted to start a real agent or terminal manager: {executable}")
         return original(argv, *args, **kwargs)
 
