@@ -253,9 +253,10 @@ def test_main_forwards_explicit_permission_opt_ins(monkeypatch, capsys, backend)
 
     monkeypatch.setattr(sd, f"dispatch_{backend}", dispatch)
     if backend == "local":
-        def receipt_check(folder, skill, dispatch_id, seconds):
+        def receipt_check(folder, skill, dispatch_id, seconds, git_identity):
             assert folder == (WORKSPACES / "data-tools").resolve()
             assert skill == "summarize-csv" and seconds == 0
+            assert git_identity["repo_commit"] and git_identity["skill_blob"]
             return True
 
         monkeypatch.setattr(sd, "wait_for_receipt", receipt_check)
