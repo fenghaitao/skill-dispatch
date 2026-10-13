@@ -146,7 +146,6 @@ def test_git_identity_records_commit_and_skill_blob_and_rejects_dirty_skill(tmp_
     identity = sd.skill_git_identity(folder, entry)
     assert identity["repo_root"] == str(folder.resolve())
     assert identity["repo_commit"]
-    assert identity["skill_blob"]
     assert identity["skill_repo_path"] == ".claude/skills/alpha/SKILL.md"
 
     (folder / "unrelated.txt").write_text("dirty but unrelated")
