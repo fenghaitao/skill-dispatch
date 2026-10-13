@@ -1,4 +1,4 @@
-"""Discovery, routing and receipt checks; no agent is started."""
+"""Discovery, routing and Git identity checks; no agent is started."""
 import json
 import subprocess
 import sys
@@ -138,25 +138,23 @@ def test_print_backend_shows_the_plan_without_starting_an_agent(capsys, monkeypa
     assert "`summarize-csv` skill" in plan["prompt"]
 
 
-def test_verify_checks_git_identity_and_folder(tmp_path):
+def test_git_identity_records_commit_and_skill_blob_and_rejects_dirty_skill(tmp_path):
     folder = tmp_path / "a"
     skill_path = _skill(folder, "alpha", "does alpha", body="# Alpha\n")
     _commit(folder)
     entry = sd.discover(tmp_path)["folders"][0]["skills"][0]
     identity = sd.skill_git_identity(folder, entry)
-    assert sd.verify(tmp_path, "run-1") == [{"skill": "alpha", "state": "no receipt"}]
-    receipt = folder / sd.RECEIPTS / "alpha.json"
-    receipt.parent.mkdir()
-    receipt.write_text(json.dumps({"skill": "alpha", "cwd": str(folder.resolve()),
-                                   "dispatch_id": "run-1",
-                                   "repo_commit": identity["repo_commit"],
-                                   "skill_blob": identity["skill_blob"]}))
-    assert sd.verify(tmp_path, "run-1")[0]["state"] == "ok"
+    assert identity["repo_root"] == str(folder.resolve())
+    assert identity["repo_commit"]
+    assert identity["skill_blob"]
+    assert identity["skill_repo_path"] == ".claude/skills/alpha/SKILL.md"
+
+    (folder / "unrelated.txt").write_text("dirty but unrelated")
+    assert sd.skill_git_identity(folder, entry) == identity
+
     skill_path.write_text(skill_path.read_text() + "\nchanged instructions\n")
-    result = sd.verify(tmp_path, "run-1")[0]
-    assert result["state"] == "mismatch"
-    assert result["repo_commit"] is True and result["skill_blob"] is True
-    assert result["skill_current"] is False
+    with pytest.raises(sd.DispatchError, match="uncommitted changes"):
+        sd.skill_git_identity(folder, entry)
 
 
 @pytest.mark.parametrize("description, expected", [
@@ -224,23 +222,6 @@ def test_unsafe_skill_names_are_refused(tmp_path, name):
     path.write_text(f"---\nname: {json.dumps(name)}\ndescription: things\n---\n")
     with pytest.raises(sd.DispatchError, match="invalid skill name"):
         sd.discover(tmp_path)
-    with pytest.raises(sd.DispatchError, match="invalid skill name"):
-        sd.receipt_path(tmp_path / "a", name)
-
-
-@pytest.mark.parametrize("symlink_directory", [False, True])
-def test_receipt_symlinks_cannot_escape_workspace(tmp_path, symlink_directory):
-    folder = tmp_path / "a"
-    folder.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    if symlink_directory:
-        (folder / sd.RECEIPTS).symlink_to(outside, target_is_directory=True)
-    else:
-        (folder / sd.RECEIPTS).mkdir()
-        (folder / sd.RECEIPTS / "alpha.json").symlink_to(outside / "alpha.json")
-    with pytest.raises(sd.DispatchError, match="escapes"):
-        sd.receipt_path(folder, "alpha")
 
 
 def test_folder_names_do_not_affect_routing_or_ties(tmp_path):
