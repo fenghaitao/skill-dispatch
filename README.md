@@ -186,6 +186,44 @@ servers after a trust prompt. After `agent_prompt_stalled`, dispatch keeps
 observing for up to 60 seconds without resubmitting and accepts `working`, or
 `done` with an advanced `state_change_seq`.
 
+## Workers
+
+`--agent` selects the worker CLI. Every worker starts in the selected workspace
+with conservative permissions, and the dispatcher never answers its prompts.
+
+| Agent | `local` | `orca` | `herdr` | Finds `.claude/skills/` itself |
+| --- | --- | --- | --- | --- |
+| `claude` (default) | yes | yes | yes | yes |
+| `copilot` | yes | no | yes | yes |
+| `codex` | yes | no | yes | no; the prompt names the skill file |
+
+## Claude Code workers
+
+`--agent claude` is the default and starts
+[Claude Code](https://code.claude.com/docs). Claude discovers the workspace's
+`.claude/skills/` from its working directory; see
+[Skill visibility](#skill-visibility). It is the only worker supported by every
+backend.
+
+- `local` runs `claude -p PROMPT` in the folder with stdin disabled.
+- `orca` starts `claude` in an Orca terminal, waits for Orca to report the TUI
+  idle, then sends the task.
+- `herdr` starts the worker with `herdr agent start --kind claude` and then
+  follows the readiness, launch-check and submission steps above.
+
+Permission options map directly to Claude Code flags:
+
+| Option | Claude Code |
+| --- | --- |
+| default | `--permission-mode dontAsk` |
+| `--accept-edits` | `--permission-mode acceptEdits` |
+| `--allow-tool RULE` | `--allowedTools=RULE,...` (all rules in one flag) |
+
+Rules use Claude's syntax, such as `Bash(python3 -m pytest -q)` or `Edit`.
+Use `--model` to pick a Claude model. Permission rules in Claude's own settings
+files still apply. The dispatcher controls only Claude's command line, and the
+Herdr launch check cannot see those settings.
+
 ## GitHub Copilot workers
 
 `--agent copilot` starts [GitHub Copilot CLI](https://docs.github.com/copilot)
