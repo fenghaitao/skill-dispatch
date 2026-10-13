@@ -7,7 +7,7 @@ description: Add a new arithmetic function to calc.py in the calc-lib workspace,
 
 1. Add the function to `calc.py` with a one-line docstring.
 2. Add a test named `test_<function>` to `test_calc.py`.
-3. Run `python -m pytest -q` in this folder and make sure it passes.
+3. Run `python3 -m pytest -q` in this folder and make sure it passes.
 4. Write the receipt `.skill-receipts/add-calc-function.json`:
 
    ```json
