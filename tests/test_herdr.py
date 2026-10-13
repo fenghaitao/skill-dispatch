@@ -27,15 +27,23 @@ class Clock:
         self.now += seconds
 
 
-def launch(monkeypatch, folder, handler=None):
+def launch(monkeypatch, folder, handler=None, kind='claude', processes=None):
+    """Mock Herdr agent calls. `calls` omits process-info launch checks, which
+    report the started agent's argv (or `processes`, when given)."""
     calls = []
     clock = Clock()
     monkeypatch.setattr(sd.time, 'monotonic', clock.monotonic)
     monkeypatch.setattr(sd.time, 'sleep', clock.sleep)
-    agent = {'agent': 'claude', 'pane_id': 'w7:p9', 'agent_status': 'idle',
+    agent = {'agent': kind, 'pane_id': 'w7:p9', 'agent_status': 'idle',
              'interactive_ready': True}
+    launched = []
 
     def herdr(*args, **kwargs):
+        if args[:2] == ('pane', 'process-info'):
+            assert args[2:] == ('--pane', 'w7:p9')
+            argv = [kind, *launched[-1][launched[-1].index('--') + 1:]]
+            return {'process_info': {'foreground_processes': processes if processes is not None
+                                     else [{'argv': argv}]}}
         calls.append((args, kwargs))
         if args[:2] == ('tab', 'create'):
             assert args[2:] == ('--workspace', 'w7', '--cwd', str(folder.resolve()),
@@ -44,7 +52,8 @@ def launch(monkeypatch, folder, handler=None):
         if args[:2] == ('agent', 'start'):
             agent['name'] = args[2]
             assert re.fullmatch(r'sd-[0-9a-f]{20}', args[2])
-            assert args[3:7] == ('--kind', 'claude', '--pane', 'w7:p9')
+            assert args[3:7] == ('--kind', kind, '--pane', 'w7:p9')
+            launched.append(args)
         else:
             assert args[2] == agent['name']
         if handler:
@@ -246,7 +255,7 @@ def test_idle_alone_does_not_prove_interactive_readiness(tmp_path, monkeypatch, 
     assert [a[1] for a, _ in calls] == ['create', 'start', 'get', 'prompt']
 
 
-@pytest.mark.parametrize('code', ['agent_blocked', 'agent_prompt_stalled', 'timeout'])
+@pytest.mark.parametrize('code', ['agent_blocked', 'timeout'])
 def test_prompt_failure_is_never_automatically_resubmitted(tmp_path, monkeypatch, herdr_env, code):
     def handler(args, kwargs, clock, agent):
         if args[1] == 'prompt':
@@ -266,3 +275,98 @@ def test_worker_blocked_after_submission_is_reported(tmp_path, monkeypatch, herd
     launch(monkeypatch, tmp_path, handler)
     with pytest.raises(sd.DispatchError, match='blocked after submission'):
         sd.dispatch_herdr(tmp_path, 'task', 'worker', None, 5)
+
+
+@pytest.mark.parametrize('opt_in', [False, True])
+def test_copilot_worker_uses_copilot_kind_and_permission_rules(tmp_path, monkeypatch, herdr_env, opt_in):
+    calls, _ = launch(monkeypatch, tmp_path, kind='copilot')
+    result = sd.dispatch_herdr(tmp_path, 'task', 'worker', 'gpt-x', 5, accept_edits=opt_in,
+                               allow_tools=['shell(python3)'], agent='copilot')
+    edits = ['--allow-tool=write', '--allow-tool=shell(mkdir)', '--allow-tool=shell(mv)']
+    assert list(calls[1][0][9:]) == ['--', '--no-ask-user', *(edits if opt_in else []),
+                                     '--allow-tool=shell(python3)', '--model=gpt-x']
+    assert calls[2][0][:2] == ('agent', 'prompt')
+    assert (result['kind'], result['accepted']) == ('copilot', True)
+
+
+def test_copilot_rejects_claude_rules_before_creating_a_tab(tmp_path, monkeypatch, herdr_env):
+    monkeypatch.setattr(sd, '_herdr', lambda *a, **kw: pytest.fail('created a tab'))
+    with pytest.raises(sd.DispatchError, match='Claude tool rule'):
+        sd.dispatch_herdr(tmp_path, 'task', 'worker', None, 5,
+                          allow_tools=['Bash(python3 -m pytest -q)'], agent='copilot')
+
+
+@pytest.mark.parametrize('kind', ['claude', 'copilot'])
+def test_worker_must_be_a_herdr_agent_of_the_requested_kind(tmp_path, monkeypatch, herdr_env, kind):
+    other = 'copilot' if kind == 'claude' else 'claude'
+
+    def handler(args, kwargs, clock, agent):
+        if args[1] == 'start':
+            return {'agent': {**agent, 'agent': other}}
+
+    calls, _ = launch(monkeypatch, tmp_path, handler, kind=kind)
+    with pytest.raises(sd.DispatchError, match='different or missing worker'):
+        sd.dispatch_herdr(tmp_path, 'task', 'worker', None, 5, agent=kind)
+    assert not any(a[1] == 'prompt' for a, _ in calls)
+
+
+@pytest.mark.parametrize('processes', [
+    [{'argv': ['copilot', '--allow-all', '--autopilot', '--no-ask-user']}],  # shell alias
+    [{'argv': ['bash']}],
+    [],
+    [{'argv': 'copilot --no-ask-user'}],
+])
+def test_unexpected_launch_options_prevent_submission(tmp_path, monkeypatch, herdr_env, processes):
+    calls, _ = launch(monkeypatch, tmp_path, kind='copilot', processes=processes)
+    with pytest.raises(sd.DispatchError, match='requested options.*Inspect this worker'):
+        sd.dispatch_herdr(tmp_path, 'task', 'worker', None, 5, agent='copilot')
+    assert not any(a[1] == 'prompt' for a, _ in calls)
+
+
+def test_unrelated_foreground_processes_are_ignored(tmp_path, monkeypatch, herdr_env):
+    processes = [{'argv': ['/usr/bin/copilot', '--no-ask-user']}, {'argv': ['node', 'mcp-server']}]
+    launch(monkeypatch, tmp_path, kind='copilot', processes=processes)
+    assert sd.dispatch_herdr(tmp_path, 'task', 'worker', None, 5, agent='copilot')['accepted'] is True
+
+
+@pytest.mark.parametrize('late', [{'agent_status': 'working', 'state_change_seq': 3},
+                                  {'agent_status': 'done', 'state_change_seq': 5}])
+def test_stalled_prompt_gate_observes_late_activity_without_resubmitting(
+        tmp_path, monkeypatch, herdr_env, late):
+    states = iter([{'agent_status': 'idle', 'state_change_seq': 2}] * 3 + [late])
+
+    def handler(args, kwargs, clock, agent):
+        if args[1] == 'start':
+            return {'agent': {**agent, 'state_change_seq': 2}}
+        if args[1] == 'prompt':
+            raise sd.HerdrError('no activity within 5000 ms', 'agent_prompt_stalled')
+        if args[1] == 'get':
+            return {'agent': {**agent, **next(states)}}
+
+    calls, _ = launch(monkeypatch, tmp_path, handler)
+    result = sd.dispatch_herdr(tmp_path, 'task', 'worker', None, 5)
+    assert sum(a[1] == 'prompt' for a, _ in calls) == 1
+    assert [a[1] for a, _ in calls[3:]] == ['get'] * 4
+    assert result['accepted'] is True and result['send']['late_activity'] is True
+
+
+@pytest.mark.parametrize('late,match', [
+    ({'agent_status': 'done', 'state_change_seq': 2}, 'no activity was observed'),  # unchanged
+    ({'agent_status': 'idle', 'state_change_seq': 9}, 'no activity was observed'),
+    ({'agent_status': 'done'}, 'no activity was observed'),
+    ({'agent_status': 'blocked', 'state_change_seq': 3}, 'blocked after submission'),
+])
+def test_stalled_prompt_gate_fails_without_evidence(tmp_path, monkeypatch, herdr_env, late, match):
+    def handler(args, kwargs, clock, agent):
+        if args[1] == 'start':
+            return {'agent': {**agent, 'state_change_seq': 2}}
+        if args[1] == 'prompt':
+            raise sd.HerdrError('no activity within 5000 ms', 'agent_prompt_stalled')
+        if args[1] == 'get':
+            return {'agent': {**agent, **late}}
+
+    calls, clock = launch(monkeypatch, tmp_path, handler)
+    with pytest.raises(sd.DispatchError, match=f'{match}.*Inspect this worker'):
+        sd.dispatch_herdr(tmp_path, 'task', 'worker', None, 5)
+    assert sum(a[1] == 'prompt' for a, _ in calls) == 1
+    assert clock.now <= sd.HERDR_LATE_ACTIVITY_SECONDS + 1

@@ -40,3 +40,35 @@ selected skill's blob ID before launch. See [design.md](design.md).
 
 A blocked startup remains a human decision: resolve it in the Herdr tab. The
 dispatcher observes readiness but does not answer trust prompts.
+
+## GitHub Copilot workers
+
+Checked on 2026-10-13 with Herdr 0.9.3 client / 0.9.1 server (protocol 22),
+GitHub Copilot CLI 1.0.91 and Python 3.13. Like the run above, these live
+checks predate the simplified design: completion was then evidenced by
+worker-written receipts, which the current dispatcher no longer uses.
+
+- Local demo: `AGENT=copilot scripts/demo.sh local <scratch> --accept-edits
+  --allow-tool 'shell(python3)'` completed all three tasks; `multiply` and its
+  test were added and pass, the 0.2.0 release note is above 0.1.0, and the CSV
+  report matches the source (4 rows, total 445).
+- Herdr probes: `herdr agent start --kind copilot` reports `agent: "copilot"`,
+  returns `agent_not_ready` while Copilot shows its folder-trust prompt, and
+  then reports `idle` with `interactive_ready: true`. `herdr agent prompt`
+  acknowledged a task as `working` and the worker reached `done`.
+- Launch check: with a `~/.bashrc` alias of `copilot` to
+  `copilot --allow-all --autopilot`, a Herdr shell applies it. A live
+  `--backend herdr --agent copilot` dispatch found those extra options with
+  `herdr pane process-info` and refused to send the task, as intended.
+- Herdr demo, with the alias removed: `AGENT=copilot scripts/demo.sh herdr
+  <scratch> --accept-edits --allow-tool 'shell(python3)'` completed all three
+  tasks with `accepted: true`; the artifacts matched the local demo.
+- An earlier Herdr attempt hit `agent_prompt_stalled`: Copilot started the turn
+  more than five seconds after Herdr accepted the input, although the task ran.
+  Dispatch now keeps observing after that error, never resubmitting.
+- Claude + Herdr with the launch check: a live `--backend herdr --agent claude
+  --accept-edits` dispatch passed the check and reported `accepted: true` and
+  `activity_observed: true`.
+
+Folder-trust prompts, and shell commands outside the `--accept-edits` rules,
+were approved by hand in scratch folders; the dispatcher did not answer them.

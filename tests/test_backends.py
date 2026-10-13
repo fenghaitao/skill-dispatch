@@ -35,7 +35,49 @@ def test_local_argv_cwd_permissions_and_quoting(tmp_path, monkeypatch, opt_in):
                     f"--model={model}"]
     assert kwargs == {"capture_output": True, "text": True, "cwd": folder.resolve(),
                       "timeout": 900, "stdin": subprocess.DEVNULL}
-    assert result == {"backend": "local", "exit": 0, "output": "done"}
+    assert result == {"backend": "local", "agent": "claude", "exit": 0, "output": "done"}
+
+
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_local_copilot_argv_cwd_and_permission_rules(tmp_path, monkeypatch, opt_in):
+    calls = []
+    prompt = "Task: $(touch unwanted); 'quoted'"
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "done", "")
+
+    monkeypatch.setattr(sd.subprocess, "run", run)
+    result = sd.dispatch_local(tmp_path, prompt, "gpt-x", accept_edits=opt_in,
+                               allow_tools=["shell(python3)", "url(github.com)"], agent="copilot")
+    argv, kwargs = calls[0]
+    edits = ["--allow-tool=write", "--allow-tool=shell(mkdir)", "--allow-tool=shell(mv)"]
+    assert argv == ["copilot", "-p", prompt, "-s", "--no-ask-user", *(edits if opt_in else []),
+                    "--allow-tool=shell(python3)", "--allow-tool=url(github.com)", "--model=gpt-x"]
+    assert not any(a in argv for a in ("--allow-all", "--allow-all-tools", "--yolo", "--autopilot"))
+    assert kwargs == {"capture_output": True, "text": True, "cwd": tmp_path.resolve(),
+                      "timeout": 900, "stdin": subprocess.DEVNULL}
+    assert result == {"backend": "local", "agent": "copilot", "exit": 0, "output": "done"}
+
+
+@pytest.mark.parametrize("rule", ["Bash", "Bash(python3 -m pytest -q)", "Edit", "Write(calc.py)", "Read"])
+def test_copilot_rejects_claude_rules_before_starting(monkeypatch, rule):
+    monkeypatch.setattr(sd.subprocess, "run", lambda *a, **kw: pytest.fail("started a worker"))
+    with pytest.raises(sd.DispatchError, match="Claude tool rule"):
+        sd.dispatch_local(Path("."), "task", None, allow_tools=[rule], agent="copilot")
+
+
+def test_orca_rejects_copilot_before_contacting_orca(monkeypatch, tmp_path):
+    monkeypatch.setattr(sd, "_orca", lambda *a, **kw: pytest.fail("contacted Orca"))
+    with pytest.raises(sd.DispatchError, match="only --agent claude"):
+        sd.dispatch_orca(tmp_path, "task", "worker", None, 5, agent="copilot")
+
+
+def test_main_rejects_unknown_agent(capsys):
+    with pytest.raises(SystemExit):
+        sd.main(["dispatch", "--root", str(WORKSPACES), "--task", "Summarize sales.csv",
+                 "--backend", "local", "--agent", "codex"])
+    capsys.readouterr()
 
 
 def test_local_nonzero_exit_and_stderr_reach_main(monkeypatch, capsys):
@@ -243,17 +285,19 @@ def test_orca_zero_readiness_budget_starts_nothing(monkeypatch, tmp_path):
         sd.dispatch_orca(tmp_path, "task", "worker", None, 0)
 
 
+@pytest.mark.parametrize("agent", ["claude", "copilot"])
 @pytest.mark.parametrize("backend", ["local", "orca", "herdr"])
-def test_main_forwards_explicit_permission_opt_ins(monkeypatch, capsys, backend):
+def test_main_forwards_explicit_permission_opt_ins(monkeypatch, capsys, backend, agent):
     def dispatch(folder, prompt, *args, **kwargs):
         assert folder == (WORKSPACES / "data-tools").resolve()
-        assert kwargs == {"accept_edits": True, "allow_tools": ["Read", "Bash(python3 -m pytest -q)"]}
+        assert kwargs == {"accept_edits": True, "allow_tools": ["Read", "Bash(python3 -m pytest -q)"],
+                          "agent": agent}
         return {"backend": backend, **({"exit": 0} if backend == "local" else {"accepted": True})}
 
     monkeypatch.setattr(sd, f"dispatch_{backend}", dispatch)
     assert sd.main(["dispatch", "--root", str(WORKSPACES), "--task", "Summarize sales.csv",
                     "--backend", backend, "--accept-edits", "--allow-tool", "Read",
-                    "--allow-tool", "Bash(python3 -m pytest -q)"]) == 0
+                    "--allow-tool", "Bash(python3 -m pytest -q)", "--agent", agent]) == 0
     capsys.readouterr()
 
 

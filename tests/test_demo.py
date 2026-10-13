@@ -23,7 +23,7 @@ def demo_env(tmp_path):
     assert real_git
     git.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$GIT_CALLS"\nexec "{real_git}" "$@"\n')
     git.chmod(0o755)
-    for name in ("claude", "orca", "orca-ide", "herdr"):
+    for name in ("claude", "copilot", "orca", "orca-ide", "herdr"):
         worker = binaries / name
         worker.write_text('#!/usr/bin/env bash\necho unexpected-worker >> "$WORKER_CALLS"\nexit 99\n')
         worker.chmod(0o755)
@@ -107,6 +107,13 @@ def test_demo_rejects_invalid_options_before_creating_scratch(tmp_path, demo_env
     assert not scratch.exists() and not Path(demo_env["GIT_CALLS"]).exists()
 
 
+def test_demo_rejects_invalid_agent_before_creating_scratch(tmp_path, demo_env):
+    scratch = tmp_path / "new"
+    result = run_demo({**demo_env, "AGENT": "codex"}, "print", scratch)
+    assert result.returncode == 2 and "invalid AGENT" in result.stderr
+    assert not scratch.exists() and not Path(demo_env["GIT_CALLS"]).exists()
+
+
 def print_plans(stdout):
     stream = stdout.split("\n", 1)[1].lstrip()
     decoder = json.JSONDecoder()
@@ -155,7 +162,9 @@ def test_demo_default_scratch_uses_a_fresh_temporary_directory(tmp_path, demo_en
     assert scratch.parent == tmp_path and scratch.name.startswith("skill-dispatch-demo.")
 
 
-def test_herdr_demo_dispatches_each_task_without_receipt_protocol(tmp_path, demo_env):
+@pytest.mark.parametrize('agent,rule', [(None, 'Bash(python3 -m pytest -q)'),
+                                        ('copilot', 'shell(python3)')])
+def test_herdr_demo_dispatches_each_task_without_receipt_protocol(tmp_path, demo_env, agent, rule):
     # Stub only the dispatcher entrypoint; keep scratch setup and CLI assembly real.
     wrapper = tmp_path / 'python-dispatch-stub'
     calls = tmp_path / 'dispatch-calls.jsonl'
@@ -169,9 +178,10 @@ def test_herdr_demo_dispatches_each_task_without_receipt_protocol(tmp_path, demo
         'else:\n'
         '    sys.exit(subprocess.run([sys.executable, *sys.argv[1:]]).returncode)\n')
     wrapper.chmod(0o755)
-    env = {**demo_env, 'PYTHON': str(wrapper), 'DISPATCH_CALLS': str(calls)}
+    env = {**demo_env, 'PYTHON': str(wrapper), 'DISPATCH_CALLS': str(calls),
+           **({'AGENT': agent} if agent else {})}
     result = subprocess.run(['bash', str(SCRIPT), 'herdr', str(tmp_path / 'scratch'),
-                             '--accept-edits', '--allow-tool', 'Bash(python3 -m pytest -q)'],
+                             '--accept-edits', '--allow-tool', rule],
                             cwd=REPO, env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     assert not Path(env['WORKER_CALLS']).exists()
@@ -182,4 +192,5 @@ def test_herdr_demo_dispatches_each_task_without_receipt_protocol(tmp_path, demo
         assert '--wait' not in command
         assert '--dispatch-id' not in command
         assert '--accept-edits' in command
-        assert '--allow-tool=Bash(python3 -m pytest -q)' in command
+        assert command[command.index('--agent') + 1] == (agent or 'claude')
+        assert f'--allow-tool={rule}' in command

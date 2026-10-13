@@ -9,7 +9,8 @@ skill locally. Execution lifecycle and history belong to the backend session.
     skill_dispatch.py discover --root <dir>
     skill_dispatch.py route    --root <dir> --task "..." [--skill NAME]
     skill_dispatch.py dispatch --root <dir> --task "..." [--skill NAME]
-                               [--backend print|local|orca|herdr] [--model M]
+                               [--backend print|local|orca|herdr] [--agent claude|copilot]
+                               [--model M]
 
 Backends:
   print  show the plan only;
@@ -17,8 +18,11 @@ Backends:
   orca   open an Orca terminal in the folder, start `claude` there and send the task.
          A trust prompt for a new folder is left to a person; the dispatcher
          names the waiting tab and sends the task once the agent is ready.
-  herdr  open a background tab in the caller's Herdr workspace and start Claude
+  herdr  open a background tab in the caller's Herdr workspace and start the worker
          through the agent API; wait for readiness before submitting the task.
+
+Agents: `claude` (Claude Code, the default) or `copilot` (GitHub Copilot CLI, which
+also loads `.claude/skills`). Copilot works with the local and herdr backends.
 
 Existing skills are never modified and no receipt protocol is injected into
 their tasks. Git identifies the code/skill snapshot; the local process or the
@@ -44,6 +48,12 @@ SKILL_GLOB = ".claude/skills/*/SKILL.md"
 MAX_FRONTMATTER_BYTES = 16 * 1024
 SKILL_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 ORCA_WAIT_MARGIN_SECONDS = 5
+HERDR_LATE_ACTIVITY_SECONDS = 60
+AGENTS = ("claude", "copilot")
+# --accept-edits for Copilot: file writes plus common move/mkdir commands, like acceptEdits.
+COPILOT_EDIT_RULES = ("write", "shell(mkdir)", "shell(mv)")
+CLAUDE_TOOL_RULE = re.compile(r"(Bash|Edit|MultiEdit|Write|Read|NotebookEdit|Glob|Grep|"
+                              r"WebFetch|WebSearch|Task)(\(|$)")
 
 
 class DispatchError(Exception):
@@ -261,6 +271,33 @@ def permission_args(accept_edits: bool = False, allow_tools: list[str] | None = 
     return argv
 
 
+def copilot_permission_args(accept_edits: bool = False, allow_tools: list[str] | None = None) -> list[str]:
+    """Copilot prompts for writes and commands (denies them under -p) unless a rule allows them."""
+    rules = list(COPILOT_EDIT_RULES) if accept_edits else []
+    for rule in allow_tools or []:
+        if CLAUDE_TOOL_RULE.match(rule):
+            raise DispatchError(f"{rule!r} is a Claude tool rule; Copilot rules look like "
+                                "shell(python3) or write")
+        rules.append(rule)
+    # The flag takes several values; one rule per --allow-tool= cannot swallow later options.
+    return [f"--allow-tool={rule}" for rule in rules]
+
+
+def agent_args(agent: str, model: str | None = None, *, accept_edits: bool = False,
+               allow_tools: list[str] | None = None) -> list[str]:
+    """Options following the worker executable: permissions, then the model."""
+    if agent == "claude":
+        argv = permission_args(accept_edits, allow_tools)
+    elif agent == "copilot":
+        # A worker cannot ask questions back through the dispatcher.
+        argv = ["--no-ask-user", *copilot_permission_args(accept_edits, allow_tools)]
+    else:
+        raise DispatchError(f"unsupported agent {agent!r}; choose from {', '.join(AGENTS)}")
+    if model:
+        argv += [f"--model={model}"]
+    return argv
+
+
 def validate_seconds(seconds: float) -> float:
     if not math.isfinite(seconds) or seconds < 0:
         raise DispatchError("durations must be finite and nonnegative")
@@ -276,14 +313,14 @@ def seconds_argument(value: str) -> float:
 
 def dispatch_orca(folder: Path, prompt: str, title: str, model: str | None,
                   ready_seconds: float = 600, *, accept_edits: bool = False,
-                  allow_tools: list[str] | None = None) -> dict:
+                  allow_tools: list[str] | None = None, agent: str = "claude") -> dict:
+    if agent != "claude":
+        raise DispatchError("the orca backend supports only --agent claude")
     validate_seconds(ready_seconds)
     if ready_seconds < 0.001:
         raise DispatchError("readiness budget expired; task not sent")
-    argv = ["claude", *permission_args(accept_edits, allow_tools)]
-    if model:
-        argv += [f"--model={model}"]
-    command = shlex.join(argv)
+    command = shlex.join(["claude", *agent_args("claude", model, accept_edits=accept_edits,
+                                                allow_tools=allow_tools)])
     worktree = orca_worktree(folder)
     terminal = _orca("terminal", "create", "--worktree", f"id:{worktree}",
                      "--title", title, "--command", command)["terminal"]["handle"]
@@ -333,12 +370,13 @@ def dispatch_orca(folder: Path, prompt: str, title: str, model: str | None,
 
 
 def dispatch_local(folder: Path, prompt: str, model: str | None, *,
-                   accept_edits: bool = False, allow_tools: list[str] | None = None) -> dict:
-    argv = ["claude", "-p", prompt, *permission_args(accept_edits, allow_tools)]
-    if model:
-        argv += [f"--model={model}"]
+                   accept_edits: bool = False, allow_tools: list[str] | None = None,
+                   agent: str = "claude") -> dict:
+    options = agent_args(agent, model, accept_edits=accept_edits, allow_tools=allow_tools)
+    # Copilot's -s prints only the agent's response, without usage statistics.
+    argv = [agent, "-p", prompt, *(["-s"] if agent == "copilot" else []), *options]
     result = _run(argv, cwd=folder.resolve(), timeout=900, stdin=subprocess.DEVNULL)
-    return {"backend": "local", "exit": result.returncode,
+    return {"backend": "local", "agent": agent, "exit": result.returncode,
             "output": (result.stdout or result.stderr).strip()[-2000:]}
 
 
@@ -366,11 +404,43 @@ def _herdr(*args: str, timeout: float = 30) -> dict:
     return value
 
 
+def herdr_check_launch(pane: str, agent: str, expected: list[str], timeout: float) -> None:
+    """Herdr types the command into a shell, where an alias or wrapper can add options
+    such as --allow-all. Require the worker to run with exactly the requested options."""
+    info = _herdr("pane", "process-info", "--pane", pane, timeout=timeout).get("process_info")
+    processes = info.get("foreground_processes") if isinstance(info, dict) else None
+    launched = [p["argv"] for p in processes or []
+                if isinstance(p, dict) and isinstance(p.get("argv"), list) and p["argv"]
+                and isinstance(p["argv"][0], str) and Path(p["argv"][0]).name == agent]
+    if not launched or any(argv[1:] != expected for argv in launched):
+        raise DispatchError(f"{agent} is not running with the requested options {expected} "
+                            f"(found {launched or 'no such process'}); a shell alias or wrapper "
+                            "may change them; task not sent")
+
+
+def herdr_late_activity(name: str, baseline, seconds: float) -> dict:
+    """After Herdr accepted a prompt but saw no activity within its fixed 5 s gate,
+    observe (never resubmit) until the worker shows that a turn started."""
+    deadline = time.monotonic() + seconds
+    while True:
+        worker = _herdr("agent", "get", name, timeout=30).get("agent")
+        status = worker.get("agent_status") if isinstance(worker, dict) else None
+        seq = worker.get("state_change_seq") if isinstance(worker, dict) else None
+        advanced = isinstance(seq, int) and isinstance(baseline, int) and seq > baseline
+        if status in {"working", "blocked"} or (status == "done" and advanced):
+            return {"type": "agent_prompted", "agent": worker, "late_activity": True}
+        if time.monotonic() >= deadline:
+            raise DispatchError(f"Herdr accepted the task but no activity was observed "
+                                f"within {seconds:g} seconds")
+        time.sleep(0.5)
+
+
 def dispatch_herdr(folder: Path, prompt: str, title: str, model: str | None,
                    ready_seconds: float = 600, *, accept_edits: bool = False,
-                   allow_tools: list[str] | None = None) -> dict:
+                   allow_tools: list[str] | None = None, agent: str = "claude") -> dict:
     """Create one background tab per task; never answer a blocked worker's UI."""
     validate_seconds(ready_seconds)
+    argv = agent_args(agent, model, accept_edits=accept_edits, allow_tools=allow_tools)
     workspace = os.environ.get("HERDR_WORKSPACE_ID")
     if os.environ.get("HERDR_ENV") != "1" or not workspace:
         raise DispatchError("herdr backend requires a Herdr terminal with HERDR_ENV=1 "
@@ -395,15 +465,12 @@ def dispatch_herdr(folder: Path, prompt: str, title: str, model: str | None,
     if not isinstance(pane, str) or not pane or not isinstance(tab, str) or not tab:
         raise DispatchError("Herdr tab create returned no tab or root pane")
     name = f"sd-{uuid.uuid4().hex[:20]}"
-    argv = permission_args(accept_edits, allow_tools)
-    if model:
-        argv += [f"--model={model}"]
     try:
         resumed_startup = False
         while True:
             budget = remaining(3.001)
             try:
-                started = _herdr("agent", "start", name, "--kind", "claude", "--pane", pane,
+                started = _herdr("agent", "start", name, "--kind", agent, "--pane", pane,
                                  "--timeout", str(min(300000, int(budget * 1000))), "--", *argv,
                                  timeout=budget)
                 break
@@ -425,13 +492,13 @@ def dispatch_herdr(folder: Path, prompt: str, title: str, model: str | None,
         ready_since = None
         while True:
             remaining()
-            agent = started.get("agent")
-            if (not isinstance(agent, dict) or agent.get("pane_id") != pane
-                    or agent.get("agent") != "claude" or agent.get("name") != name):
+            worker = started.get("agent")
+            if (not isinstance(worker, dict) or worker.get("pane_id") != pane
+                    or worker.get("agent") != agent or worker.get("name") != name):
                 raise DispatchError("Herdr returned a different or missing worker; task not sent")
-            if (agent.get("agent_status") in {"idle", "done"}
-                    and agent.get("interactive_ready") is True
-                    and not agent.get("launch_pending", False)):
+            if (worker.get("agent_status") in {"idle", "done"}
+                    and worker.get("interactive_ready") is True
+                    and not worker.get("launch_pending", False)):
                 if ready_since is None:
                     ready_since = time.monotonic()
                 # After a trust dialog, an initial ready screen can be replaced
@@ -443,24 +510,33 @@ def dispatch_herdr(folder: Path, prompt: str, title: str, model: str | None,
                 ready_since = None
             time.sleep(min(0.1, remaining()))
             started = _herdr("agent", "get", name, timeout=min(30, remaining()))
+        herdr_check_launch(pane, agent, argv, min(30, remaining()))
         remaining()
         # Wait only for observed activity, including a turn that completes
         # quickly. Herdr's prompt activity gate rejects an unchanged idle UI.
-        sent = _herdr("agent", "prompt", name, prompt, "--wait",
-                      "--until", "working", "--until", "blocked",
-                      "--until", "idle", "--until", "done", "--timeout", "10000",
-                      timeout=15)
-        agent = sent.get("agent")
-        if (sent.get("type") != "agent_prompted" or not isinstance(agent, dict)
-                or agent.get("pane_id") != pane or agent.get("name") != name
-                or agent.get("agent") != "claude"):
+        try:
+            sent = _herdr("agent", "prompt", name, prompt, "--wait",
+                          "--until", "working", "--until", "blocked",
+                          "--until", "idle", "--until", "done", "--timeout", "10000",
+                          timeout=15)
+        except HerdrError as exc:
+            # The input was accepted, but a worker can take longer than Herdr's
+            # gate to start (e.g. Copilot reloading MCP servers after trust).
+            if exc.code != "agent_prompt_stalled":
+                raise
+            sent = herdr_late_activity(name, worker.get("state_change_seq"),
+                                       HERDR_LATE_ACTIVITY_SECONDS)
+        worker = sent.get("agent")
+        if (sent.get("type") != "agent_prompted" or not isinstance(worker, dict)
+                or worker.get("pane_id") != pane or worker.get("name") != name
+                or worker.get("agent") != agent):
             raise DispatchError("Herdr did not acknowledge the task for the expected worker")
-        if agent.get("agent_status") not in {"working", "idle", "done"}:
+        if worker.get("agent_status") not in {"working", "idle", "done"}:
             raise DispatchError("Herdr worker blocked after submission; inspect its prompt")
     except (DispatchError, OSError, subprocess.SubprocessError) as exc:
         raise DispatchError(f"Herdr tab {tab}, pane {pane}, agent {name}: {exc}. "
                             "Inspect this worker before retrying; it has been left open.") from exc
-    return {"backend": "herdr", "workspace": workspace, "tab": tab, "pane": pane,
+    return {"backend": "herdr", "kind": agent, "workspace": workspace, "tab": tab, "pane": pane,
             "agent": name, "accepted": True, "activity_observed": True, "send": sent}
 
 
@@ -477,11 +553,15 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--skill")
         if name == "dispatch":
             p.add_argument("--backend", choices=("print", "local", "orca", "herdr"), default="print")
+            p.add_argument("--agent", choices=AGENTS, default="claude",
+                           help="worker CLI: Claude Code or GitHub Copilot CLI (local/herdr)")
             p.add_argument("--model")
             p.add_argument("--accept-edits", action="store_true",
                            help="opt in to automatic approval of in-scope edits")
             p.add_argument("--allow-tool", action="append", default=[], metavar="RULE",
-                           help="opt in to automatic approval of a Claude tool rule; repeatable")
+                           help="opt in to automatic approval of a tool rule in the agent's "
+                                "syntax, e.g. 'Bash(python3 -m pytest -q)' or 'shell(python3)'; "
+                                "repeatable")
             p.add_argument("--ready", type=seconds_argument, default=600,
                            help="seconds to wait for the worker to be ready (orca/herdr backends)")
     args = parser.parse_args(argv)
@@ -505,12 +585,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.backend == "local":
             plan.update(dispatch_local(folder, plan["prompt"], args.model,
-                                       accept_edits=args.accept_edits, allow_tools=args.allow_tool))
+                                       accept_edits=args.accept_edits, allow_tools=args.allow_tool,
+                                       agent=args.agent))
         else:
             dispatch = dispatch_herdr if args.backend == "herdr" else dispatch_orca
             plan.update(dispatch(folder, plan["prompt"], f"{skill} worker", args.model,
                                  args.ready, accept_edits=args.accept_edits,
-                                 allow_tools=args.allow_tool))
+                                 allow_tools=args.allow_tool, agent=args.agent))
         print(json.dumps(plan, indent=2))
         return 0 if (plan.get("exit", 0) == 0
                      and plan.get("accepted", True) is True) else 1
