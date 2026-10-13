@@ -64,10 +64,11 @@ uv run python orchestrator/skill_dispatch.py route --root workspaces --task "Sum
 uv run python orchestrator/skill_dispatch.py dispatch --root <dir> --task "..." --backend local --dispatch-id example-run
 uv run python orchestrator/skill_dispatch.py verify --root <dir> --dispatch-id example-run --skill <selected-skill>
 
-uv run bash scripts/demo.sh print /tmp/sd-plan        # destination must not exist
-uv run bash scripts/demo.sh local /tmp/sd-local --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
-uv run bash scripts/demo.sh orca /tmp/sd-orca --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
-uv run bash scripts/demo.sh herdr /tmp/sd-herdr --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
+source .venv/bin/activate
+scripts/demo.sh print /tmp/sd-plan        # destination must not exist
+scripts/demo.sh local /tmp/sd-local --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
+scripts/demo.sh orca /tmp/sd-orca --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
+scripts/demo.sh herdr /tmp/sd-herdr --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
 uv run pytest -q tests
 ```
 
