@@ -115,31 +115,23 @@ def print_plans(stdout):
         plan, end = decoder.raw_decode(stream)
         plans.append(plan)
         stream = stream[end:].lstrip()
-    assert stream == "print backend: plans only; receipt verification skipped\n"
+    assert stream == ""
     return plans
 
 
-def test_demo_print_copies_hidden_skills_and_skips_verification(tmp_path, demo_env):
+def test_demo_print_copies_hidden_skills_and_records_git_identity(tmp_path, demo_env):
     scratch = tmp_path / "space ' new-scratch"
     before = sources()
     result = run_demo(demo_env, "print", scratch, "--accept-edits", "--allow-tool", "Bash(python3 -m pytest -q)")
     assert result.returncode == 0, result.stderr
     plans = print_plans(result.stdout)
     assert [plan["skill"] for plan in plans] == ["add-calc-function", "write-release-note", "summarize-csv"]
-    assert len({plan["dispatch_id"] for plan in plans}) == 1
+    assert all(plan["repo_commit"] and plan["skill_blob"] for plan in plans)
     assert all(Path(plan["folder"]).parent == scratch.resolve() for plan in plans)
     for relative, content in before.items():
         assert (scratch / Path(relative).relative_to("workspaces")).read_bytes() == content
     assert sources() == before
-    assert not list(scratch.rglob(".skill-receipts"))
     assert len(Path(demo_env["GIT_CALLS"]).read_text().splitlines()) == 24
-
-
-def test_demo_print_assigns_a_fresh_id_per_run(tmp_path, demo_env):
-    first = run_demo(demo_env, "print", tmp_path / "first")
-    second = run_demo(demo_env, "print", tmp_path / "second")
-    assert first.returncode == second.returncode == 0
-    assert print_plans(first.stdout)[0]["dispatch_id"] != print_plans(second.stdout)[0]["dispatch_id"]
 
 
 def test_demo_default_scratch_uses_a_fresh_temporary_directory(tmp_path, demo_env):
@@ -163,7 +155,7 @@ def test_demo_default_scratch_uses_a_fresh_temporary_directory(tmp_path, demo_en
     assert scratch.parent == tmp_path and scratch.name.startswith("skill-dispatch-demo.")
 
 
-def test_herdr_demo_waits_for_each_dispatch_before_verification(tmp_path, demo_env):
+def test_herdr_demo_dispatches_each_task_without_receipt_protocol(tmp_path, demo_env):
     # Stub only the dispatcher entrypoint; keep scratch setup and CLI assembly real.
     wrapper = tmp_path / 'python-dispatch-stub'
     calls = tmp_path / 'dispatch-calls.jsonl'
@@ -184,10 +176,10 @@ def test_herdr_demo_waits_for_each_dispatch_before_verification(tmp_path, demo_e
     assert result.returncode == 0, result.stderr
     assert not Path(env['WORKER_CALLS']).exists()
     commands = [json.loads(line) for line in calls.read_text().splitlines()]
-    assert [command[0] for command in commands] == ['dispatch'] * 3 + ['verify']
-    for command in commands[:3]:
+    assert [command[0] for command in commands] == ['dispatch'] * 3
+    for command in commands:
         assert command[command.index('--backend') + 1] == 'herdr'
-        assert command[command.index('--wait') + 1] == '600'
+        assert '--wait' not in command
+        assert '--dispatch-id' not in command
         assert '--accept-edits' in command
         assert '--allow-tool=Bash(python3 -m pytest -q)' in command
-    assert len({command[command.index('--dispatch-id') + 1] for command in commands}) == 1
