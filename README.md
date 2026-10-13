@@ -48,7 +48,7 @@ skill-dispatch/
 
 ## Usage
 
-This project supports Python 3.13 only and uses [uv](https://docs.astral.sh/uv/) to manage the environment and dependencies. The required uv version is declared in `pyproject.toml`.
+This project supports Python 3.13 only and uses [uv](https://docs.astral.sh/uv/) to manage the environment and dependencies.
 
 Create or update the local environment with:
 
