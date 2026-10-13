@@ -28,7 +28,7 @@ def git_identity(folder):
     catalog = sd.discover(folder.parent)
     entry = next((skill for item in catalog["folders"]
                   if Path(item["path"]) == folder.resolve()
-                  for skill in item["skills"] if skill["name"] == "alpha")
+                  for skill in item["skills"] if skill["name"] == "alpha"))
     return sd.skill_git_identity(folder, entry)
 
 
