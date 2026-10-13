@@ -126,7 +126,7 @@ def test_demo_print_copies_hidden_skills_and_records_git_identity(tmp_path, demo
     assert result.returncode == 0, result.stderr
     plans = print_plans(result.stdout)
     assert [plan["skill"] for plan in plans] == ["add-calc-function", "write-release-note", "summarize-csv"]
-    assert all(plan["repo_commit"] and plan["skill_blob"] for plan in plans)
+    assert all(plan["repo_commit"] and plan["skill_repo_path"] for plan in plans)
     assert all(Path(plan["folder"]).parent == scratch.resolve() for plan in plans)
     for relative, content in before.items():
         assert (scratch / Path(relative).relative_to("workspaces")).read_bytes() == content
