@@ -15,14 +15,28 @@ def workspace(tmp_path):
     folder = tmp_path / "a"
     skill = folder / ".claude/skills/alpha/SKILL.md"
     skill.parent.mkdir(parents=True)
-    skill.write_text('---\nname: alpha\ndescription: parse widgets\n---\n{"token": "tok-1"}\n')
+    skill.write_text('---\nname: alpha\ndescription: parse widgets\n---\n\n# Alpha\n')
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=folder, check=True)
+    subprocess.run(["git", "add", "."], cwd=folder, check=True)
+    subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                    "commit", "-q", "-m", "initial"], cwd=folder, check=True)
     (folder / sd.RECEIPTS).mkdir()
     return folder
 
 
+def git_identity(folder):
+    catalog = sd.discover(folder.parent)
+    entry = next((skill for item in catalog["folders"]
+                  if Path(item["path"]) == folder.resolve()
+                  for skill in item["skills"] if skill["name"] == "alpha")
+    return sd.skill_git_identity(folder, entry)
+
+
 def receipt_data(folder, **overrides):
-    return {"skill": "alpha", "token": "tok-1", "cwd": str(folder.resolve()),
-            "dispatch_id": "run-1", **overrides}
+    identity = git_identity(folder)
+    return {"skill": "alpha", "cwd": str(folder.resolve()), "dispatch_id": "run-1",
+            "repo_commit": identity["repo_commit"], "skill_blob": identity["skill_blob"],
+            **overrides}
 
 
 def write_receipt(folder, data):
@@ -62,8 +76,9 @@ def test_verify_only_selected_dispatched_skills(workspace, capsys):
 
 
 @pytest.mark.parametrize("data", [[], None, 3, "receipt", {},
-                                   {"skill": "alpha", "token": "tok-1", "dispatch_id": "run-1"},
-                                   {"skill": "alpha", "token": "tok-1", "cwd": ".", "dispatch_id": "run-1"}])
+                                   {"skill": "alpha", "dispatch_id": "run-1"},
+                                   {"skill": "alpha", "cwd": ".", "dispatch_id": "run-1",
+                                    "repo_commit": "abc", "skill_blob": "def"}])
 def test_verify_rejects_nonobjects_missing_fields_and_relative_cwd(workspace, monkeypatch, data):
     monkeypatch.chdir(workspace)
     write_receipt(workspace, data)
@@ -71,7 +86,7 @@ def test_verify_rejects_nonobjects_missing_fields_and_relative_cwd(workspace, mo
     assert sd.wait_for_receipt(workspace, "alpha", "run-1", 0) is False
 
 
-@pytest.mark.parametrize("key", ["skill", "token", "cwd", "dispatch_id"])
+@pytest.mark.parametrize("key", ["skill", "cwd", "dispatch_id", "repo_commit", "skill_blob"])
 @pytest.mark.parametrize("value", [None, [], 7, "", " "])
 def test_receipt_fields_must_be_nonempty_strings(workspace, key, value):
     write_receipt(workspace, receipt_data(workspace, **{key: value}))
@@ -82,14 +97,15 @@ def test_receipt_fields_must_be_nonempty_strings(workspace, key, value):
     ("cwd", "/definitely-not-this-workspace", "cwd"),
     ("skill", "beta", "identity"),
     ("dispatch_id", "old-run", "dispatch"),
-    ("token", "guess", "token"),
+    ("repo_commit", "deadbeef", "repo_commit"),
+    ("skill_blob", "deadbeef", "skill_blob"),
 ])
 def test_verify_checks_all_receipt_identity_fields(workspace, field, value, check):
+    expected = git_identity(workspace)
     write_receipt(workspace, receipt_data(workspace, **{field: value}))
     result = sd.verify(workspace.parent, "run-1")[0]
     assert result["state"] == "mismatch" and result[check] is False
-    if field != "token":
-        assert sd.wait_for_receipt(workspace, "alpha", "run-1", 0) is False
+    assert sd.wait_for_receipt(workspace, "alpha", "run-1", 0, expected) is False
 
 
 @pytest.mark.parametrize("raw", [b"{", b'{"skill":', b"\xff"])
@@ -123,7 +139,7 @@ def test_wait_rejects_stale_and_partial_receipts_until_atomic_replacement(worksp
     monkeypatch.setattr(Path, "read_text", header_forbidden)
     monkeypatch.setattr(sd.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(sd.time, "sleep", sleep)
-    assert sd.wait_for_receipt(workspace, "alpha", "run-1", 1) is True
+    assert sd.wait_for_receipt(workspace, "alpha", "run-1", 1, git_identity(workspace)) is True
     assert len(sleeps) == 2
 
 
@@ -141,7 +157,7 @@ def test_wait_for_receipt_timeout_is_bounded(workspace, monkeypatch):
     assert now[0] == 0.25 and max(sleeps) <= 0.1
 
 
-def test_verify_reads_skill_body_only_in_verification(workspace, monkeypatch):
+def test_verify_does_not_parse_skill_body(workspace, monkeypatch):
     write_receipt(workspace, receipt_data(workspace))
     reads = []
     original = Path.read_text
@@ -154,7 +170,7 @@ def test_verify_reads_skill_body_only_in_verification(workspace, monkeypatch):
     sd.discover(workspace.parent)
     assert not reads
     assert sd.verify(workspace.parent, "run-1")[0]["state"] == "ok"
-    assert any(path.name == "SKILL.md" for path in reads)
+    assert all(path.name != "SKILL.md" for path in reads)
 
 
 def test_print_dispatch_generates_distinct_ids_and_atomic_receipt_instruction(workspace, capsys):
@@ -208,7 +224,7 @@ def test_mocked_dispatch_wait_requires_current_receipt(workspace, monkeypatch, c
 
 @pytest.mark.parametrize("receipt_kind", ["missing", "malformed", "nonobject", "missing-cwd",
                                           "relative-cwd", "wrong-cwd", "wrong-skill", "stale",
-                                          "empty-token", "valid"])
+                                          "wrong-commit", "wrong-blob", "valid"])
 def test_local_dispatch_requires_current_receipt_by_default(workspace, monkeypatch, capsys, receipt_kind):
     calls = []
     original_read = Path.read_text
@@ -240,8 +256,10 @@ def test_local_dispatch_requires_current_receipt_by_default(workspace, monkeypat
                     data["skill"] = "beta"
                 elif receipt_kind == "stale":
                     data["dispatch_id"] = "old-run"
-                elif receipt_kind == "empty-token":
-                    data["token"] = ""
+                elif receipt_kind == "wrong-commit":
+                    data["repo_commit"] = "deadbeef"
+                elif receipt_kind == "wrong-blob":
+                    data["skill_blob"] = "deadbeef"
                 write_receipt(workspace, data)
         return subprocess.CompletedProcess(argv, 0, "edits denied or worker finished", "")
 
