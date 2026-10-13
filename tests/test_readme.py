@@ -1,42 +1,44 @@
-"""Documentation contracts for discovery, verification and conservative defaults."""
+"""Documentation contracts for the simplified dispatcher design."""
 import re
-import shlex
 from pathlib import Path
 
 README = Path(__file__).resolve().parents[1] / "README.md"
+DESIGN = README.parent / "docs/design.md"
 
 
-def test_readme_qualifies_git_identity_and_initial_skill_visibility():
+def test_readme_documents_git_identity_session_history_and_skill_visibility():
     text = README.read_text()
-    assert "existing skills need no skill-dispatch-specific instructions" in text
     assert "repo_commit" in text and "skill_blob" in text
-    assert "many tasks can" in text and "same pinned submodule commit" in text
-    assert "A parent-folder session does not initially load" in text
-    assert "can subsequently discover nested skills" in text
+    assert "backend process/session identifies the execution" in text
+    assert "There is no dispatcher receipt, synthetic run ID, or verify command" in text
+    assert "A parent-folder Claude session does not initially load" in text
     assert "https://code.claude.com/docs/en/skills" in text
 
 
-def test_readme_documents_permission_opt_ins_receipt_ids_and_print_demo():
+def test_readme_documents_permissions_and_cli():
     text = README.read_text()
-    for option in ("--permission-mode dontAsk", "--accept-edits", "--allow-tool", "--dispatch-id", "--skill"):
+    for option in ("--permission-mode dontAsk", "--accept-edits", "--allow-tool", "--skill", "--ready"):
         assert option in text
-    assert "Print mode produces plans and explicitly skips receipt verification" in text
-    assert "These tests do not establish" in text
-    assert "It never deletes an existing" in text
+    assert "--dispatch-id" not in text
+    assert ".skill-receipts" not in text
+    assert "These tests" not in text or "do not" in text
 
 
-def test_demo_skill_commands_are_covered_by_documented_allow_rules():
+def test_design_keeps_history_with_backends_and_correctness_out_of_dispatcher():
+    text = DESIGN.read_text()
+    assert "Do not create a separate `dispatch_id` or `run_id`" in text
+    assert "backend objects and their logs are the authoritative source" in text
+    assert "There is no generic receipt or `verify` command" in text
+    assert "Task correctness is domain-specific" in text
+
+
+def test_demo_skill_commands_have_documented_allow_rules():
     repo = README.parent
     commands = []
     for skill in sorted((repo / "workspaces").glob("*/.claude/skills/*/SKILL.md")):
-        # Demo skills spell runnable shell commands as: Run `command`.
-        commands.extend((skill, command) for command in
+        commands.extend(command for command in
                         re.findall(r"\brun\s+`([^`]+)`", skill.read_text(), re.IGNORECASE))
-    assert commands, "no runnable commands found in demo skills"
-    demos = [shlex.split(line) for line in README.read_text().splitlines()
-             if line.startswith(("scripts/demo.sh local ", "scripts/demo.sh orca ", "scripts/demo.sh herdr "))]
-    assert {args[1] for args in demos} == {"local", "orca", "herdr"}
-    for args in demos:
-        rules = [args[index + 1] for index, value in enumerate(args) if value == "--allow-tool"]
-        for skill, command in commands:
-            assert f"Bash({command})" in rules, f"{skill}: {command!r} is not approved by {args}"
+    assert commands
+    text = README.read_text()
+    for command in commands:
+        assert f"Bash({command})" in text
