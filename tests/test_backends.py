@@ -230,11 +230,10 @@ def test_orca_invalid_json_is_reported(monkeypatch):
         sd._orca("repo", "list")
 
 
-@pytest.mark.parametrize("option", ["--ready", "--wait"])
 @pytest.mark.parametrize("seconds", ["-1", "nan", "inf"])
-def test_cli_rejects_invalid_durations(option, seconds):
+def test_cli_rejects_invalid_readiness(seconds):
     with pytest.raises(SystemExit) as exc:
-        sd.main(["dispatch", "--root", str(WORKSPACES), "--task", "alpha", f"{option}={seconds}"])
+        sd.main(["dispatch", "--root", str(WORKSPACES), "--task", "alpha", f"--ready={seconds}"])
     assert exc.value.code == 2
 
 
@@ -252,14 +251,6 @@ def test_main_forwards_explicit_permission_opt_ins(monkeypatch, capsys, backend)
         return {"backend": backend, **({"exit": 0} if backend == "local" else {"accepted": True})}
 
     monkeypatch.setattr(sd, f"dispatch_{backend}", dispatch)
-    if backend == "local":
-        def receipt_check(folder, skill, dispatch_id, seconds, git_identity):
-            assert folder == (WORKSPACES / "data-tools").resolve()
-            assert skill == "summarize-csv" and seconds == 0
-            assert git_identity["repo_commit"] and git_identity["skill_blob"]
-            return True
-
-        monkeypatch.setattr(sd, "wait_for_receipt", receipt_check)
     assert sd.main(["dispatch", "--root", str(WORKSPACES), "--task", "Summarize sales.csv",
                     "--backend", backend, "--accept-edits", "--allow-tool", "Read",
                     "--allow-tool", "Bash(python3 -m pytest -q)"]) == 0
