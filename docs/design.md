@@ -35,8 +35,7 @@ route to workspace + skill
   |
   v
 capture Git identity
-  |   repo_commit
-  |   skill_blob
+  |   repo_commit + skill path
   v
 start worker in workspace cwd
   |
