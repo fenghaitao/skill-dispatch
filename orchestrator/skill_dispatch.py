@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shlex
 import subprocess
@@ -168,39 +169,79 @@ def _run(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True, **kwargs)
 
 
-def _orca(*args: str) -> dict:
-    result = _run(["orca", *args, "--json"])
+def _orca(*args: str, timeout: float = 30) -> dict:
+    result = _run(["orca", *args, "--json"], timeout=timeout)
     try:
         payload = json.loads(result.stdout)
     except ValueError as exc:
         raise DispatchError(f"orca {args[0]} {args[1] if len(args) > 1 else ''}: "
                             f"{result.stderr.strip() or result.stdout.strip()}") from exc
-    if not payload.get("ok"):
-        raise DispatchError(f"orca {' '.join(args[:2])}: {payload.get('error')}")
-    return payload["result"]
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        error = payload.get("error") if isinstance(payload, dict) else "invalid response"
+        raise DispatchError(f"orca {' '.join(args[:2])}: {error}")
+    value = payload.get("result")
+    if not isinstance(value, dict):
+        raise DispatchError(f"orca {' '.join(args[:2])}: invalid result")
+    # An unsatisfied wait is a normal observation with CLI exit 1. Other
+    # nonzero exits, including rejected sends, must not become successes.
+    unsatisfied_wait = (args[:2] == ("terminal", "wait") and
+                        isinstance(value.get("wait"), dict) and
+                        value["wait"].get("satisfied") is False)
+    if result.returncode != 0 and not (result.returncode == 1 and unsatisfied_wait):
+        raise DispatchError(f"orca {' '.join(args[:2])}: exit {result.returncode}; "
+                            f"{result.stderr.strip() or value}")
+    return value
 
 
 def orca_worktree(folder: Path) -> str:
     """The Orca worktree id for `folder`, registering the folder as a repo if needed."""
     path = str(folder.resolve())
     repos = _orca("repo", "list").get("repos", [])
-    repo = next((r for r in repos if str(Path(r.get("path", "")).resolve()) == path), None)
+    repo = next((r for r in repos if r.get("path") and
+                 str(Path(r["path"]).resolve()) == path), None)
     if repo is None:
         repo = _orca("repo", "add", "--path", path).get("repo")
         if not repo:
             raise DispatchError(f"orca repo add returned no repo for {path}")
     worktrees = _orca("worktree", "list", "--repo", f"id:{repo['id']}").get("worktrees", [])
-    match = next((w for w in worktrees if str(Path(w.get("path", "")).resolve()) == path), None)
+    match = next((w for w in worktrees if w.get("path") and
+                  str(Path(w["path"]).resolve()) == path), None)
     if match is None:
         raise DispatchError(f"Orca has no worktree at {path}")
     return match["id"]
 
 
+def permission_args(accept_edits: bool = False, allow_tools: list[str] | None = None) -> list[str]:
+    """Deny unapproved operations by default; wider grants require CLI opt-ins."""
+    argv = ["--permission-mode", "acceptEdits" if accept_edits else "dontAsk"]
+    if allow_tools:
+        argv += [f"--allowedTools={','.join(allow_tools)}"]
+    return argv
+
+
+def validate_seconds(seconds: float) -> float:
+    if not math.isfinite(seconds) or seconds < 0:
+        raise DispatchError("durations must be finite and nonnegative")
+    return seconds
+
+
+def seconds_argument(value: str) -> float:
+    try:
+        return validate_seconds(float(value))
+    except (ValueError, DispatchError) as exc:
+        raise argparse.ArgumentTypeError("duration must be finite and nonnegative") from exc
+
+
 def dispatch_orca(folder: Path, prompt: str, title: str, model: str | None,
-                  ready_seconds: float = 600) -> dict:
-    command = "claude --permission-mode acceptEdits"
+                  ready_seconds: float = 600, *, accept_edits: bool = False,
+                  allow_tools: list[str] | None = None) -> dict:
+    validate_seconds(ready_seconds)
+    if ready_seconds < 0.001:
+        raise DispatchError("readiness budget expired; task not sent")
+    argv = ["claude", *permission_args(accept_edits, allow_tools)]
     if model:
-        command += f" --model {shlex.quote(model)}"
+        argv += [f"--model={model}"]
+    command = shlex.join(argv)
     worktree = orca_worktree(folder)
     terminal = _orca("terminal", "create", "--worktree", f"id:{worktree}",
                      "--title", title, "--command", command)["terminal"]["handle"]
@@ -210,30 +251,39 @@ def dispatch_orca(folder: Path, prompt: str, title: str, model: str | None,
     deadline = time.monotonic() + ready_seconds
     noticed = None
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining < 0.001:
+            raise DispatchError(f"claude in {terminal} did not become ready"
+                                f"{f' (blocked on {noticed})' if noticed else ''}; task not sent")
         wait = _orca("terminal", "wait", "--terminal", terminal, "--for", "tui-idle",
-                     "--timeout-ms", "30000")
+                     "--timeout-ms", str(min(30000, int(remaining * 1000))), timeout=remaining)
         wait = wait.get("wait") or wait
-        if wait.get("satisfied"):
+        if time.monotonic() >= deadline:
+            raise DispatchError(f"claude in {terminal} exceeded readiness budget; task not sent")
+        if wait.get("satisfied") is True:
             break
         reason = wait.get("blockedReason")
         if reason and reason != noticed:
             print(f"waiting: Orca tab {title!r} ({terminal}) is blocked on {reason}; "
                   f"answer it there", file=sys.stderr, flush=True)
             noticed = reason
-        if time.monotonic() > deadline:
-            raise DispatchError(f"claude in {terminal} did not become ready"
-                                f"{f' (blocked on {reason})' if reason else ''}; task not sent")
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+    if time.monotonic() >= deadline:
+        raise DispatchError(f"claude in {terminal} exceeded readiness budget; task not sent")
     sent = _orca("terminal", "send", "--terminal", terminal, "--text", prompt, "--enter")
+    send = sent.get("send") or sent
+    if not isinstance(send, dict) or send.get("accepted") is not True:
+        raise DispatchError(f"Orca did not accept the task in {terminal}: {send}")
     return {"backend": "orca", "worktree": worktree, "terminal": terminal,
-            "accepted": bool((sent.get("send") or sent).get("accepted", True))}
+            "accepted": True, "send": send, "warnings": sent.get("warnings", [])}
 
 
-def dispatch_local(folder: Path, prompt: str, model: str | None) -> dict:
-    argv = ["claude", "-p", prompt, "--permission-mode", "acceptEdits",
-            "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep,Skill"]
+def dispatch_local(folder: Path, prompt: str, model: str | None, *,
+                   accept_edits: bool = False, allow_tools: list[str] | None = None) -> dict:
+    argv = ["claude", "-p", prompt, *permission_args(accept_edits, allow_tools)]
     if model:
-        argv += ["--model", model]
-    result = _run(argv, cwd=folder, timeout=900)
+        argv += [f"--model={model}"]
+    result = _run(argv, cwd=folder.resolve(), timeout=900, stdin=subprocess.DEVNULL)
     return {"backend": "local", "exit": result.returncode,
             "output": (result.stdout or result.stderr).strip()[-2000:]}
 
@@ -299,9 +349,13 @@ def main(argv: list[str] | None = None) -> int:
         if name == "dispatch":
             p.add_argument("--backend", choices=("print", "local", "orca"), default="print")
             p.add_argument("--model")
-            p.add_argument("--wait", type=float, default=0,
+            p.add_argument("--accept-edits", action="store_true",
+                           help="opt in to automatic approval of in-scope edits")
+            p.add_argument("--allow-tool", action="append", default=[], metavar="RULE",
+                           help="opt in to automatic approval of a Claude tool rule; repeatable")
+            p.add_argument("--wait", type=seconds_argument, default=0,
                            help="seconds to wait for the skill's receipt (orca backend)")
-            p.add_argument("--ready", type=float, default=600,
+            p.add_argument("--ready", type=seconds_argument, default=600,
                            help="seconds to wait for the worker to be ready (orca backend)")
     args = parser.parse_args(argv)
     try:
@@ -321,14 +375,17 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(plan, indent=2))
             return 0
         if args.backend == "local":
-            plan.update(dispatch_local(folder, plan["prompt"], args.model))
+            plan.update(dispatch_local(folder, plan["prompt"], args.model,
+                                       accept_edits=args.accept_edits, allow_tools=args.allow_tool))
         else:
             plan.update(dispatch_orca(folder, plan["prompt"], f"{skill} worker", args.model,
-                                      args.ready))
+                                      args.ready, accept_edits=args.accept_edits,
+                                      allow_tools=args.allow_tool))
             if args.wait:
                 plan["receipt"] = wait_for_receipt(folder, skill, args.wait)
         print(json.dumps(plan, indent=2))
-        return 0 if plan.get("exit", 0) == 0 and plan.get("receipt", True) else 1
+        return 0 if (plan.get("exit", 0) == 0 and plan.get("receipt", True)
+                     and plan.get("accepted", True) is True) else 1
     except (DispatchError, OSError, subprocess.SubprocessError) as exc:
         print(json.dumps({"state": "error", "error": str(exc)}))
         return 2

@@ -52,6 +52,21 @@ python3 -m pytest -q tests
 `demo.sh` copies each workspace into a scratch folder as its own git
 repository (a sub-repo), so runs never change this repository.
 
+## Permissions
+
+Both worker backends explicitly start Claude with `--permission-mode dontAsk`.
+Configured permission rules still apply; operations needing approval are denied
+unless an existing rule allows them. Dispatch does not add blanket tool approvals.
+The default can therefore prevent a worker from editing files or writing a receipt.
+
+Pass `--accept-edits` to opt in to `acceptEdits` for in-scope file edits and common
+filesystem commands. Pass repeatable `--allow-tool RULE` options to preapprove
+specific tools, for example `--allow-tool 'Bash(python3 -m pytest -q)'`.
+Bare tool names such as `--allow-tool Bash` grant broad approvals and should be
+chosen deliberately. A working directory is not a filesystem sandbox; use a
+container or other isolation when workers must not access other folders.
+The dispatcher never answers a trust prompt, including with either opt-in flag.
+
 ## Findings
 
 - A Claude Code session started in the folder that holds the sub-repos sees

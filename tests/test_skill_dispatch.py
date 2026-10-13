@@ -121,7 +121,8 @@ def test_no_match_and_ties_ask_for_a_skill(tmp_path):
         sd.route(catalog, "parse things")
 
 
-def test_print_backend_shows_the_plan_without_starting_an_agent(capsys):
+def test_print_backend_shows_the_plan_without_starting_an_agent(capsys, monkeypatch):
+    monkeypatch.setattr(sd, "_run", lambda *a, **kw: pytest.fail("print backend launched a process"))
     assert sd.main(["dispatch", "--root", str(WORKSPACES), "--task", "Summarize sales.csv"]) == 0
     plan = json.loads(capsys.readouterr().out)
     assert plan["skill"] == "summarize-csv" and plan["folder"].endswith("data-tools")
