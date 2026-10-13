@@ -92,6 +92,11 @@ for a different task in the same workspace. Record the generated ID, or supply
 your own unique ID when coordinating dispatch and verification.
 Legacy receipts without a dispatch ID fail validation.
 
+Local dispatch always checks for a complete receipt for the current dispatch
+after the synchronous worker returns. A zero worker exit with a missing or
+invalid receipt makes dispatch exit nonzero. `--wait` allows extra waiting for
+a successful worker's receipt; a failed worker does not trigger extra waiting.
+
 `--wait SECONDS` waits for complete receipt JSON with the selected skill, absolute
 folder and current dispatch ID. Waiting does not read skill bodies or check the
 secret token; run `verify` afterward to check the token. A send acknowledgement

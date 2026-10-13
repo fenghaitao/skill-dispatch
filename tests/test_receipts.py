@@ -1,5 +1,6 @@
 """Receipt schema, per-dispatch correlation and verification scope."""
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -203,3 +204,87 @@ def test_mocked_dispatch_wait_requires_current_receipt(workspace, monkeypatch, c
                       "--backend", backend, "--dispatch-id", "run-1", "--wait", "0.2"])
     assert result == (0 if matching_receipt else 1)
     assert json.loads(capsys.readouterr().out)["receipt"] is matching_receipt
+
+
+@pytest.mark.parametrize("receipt_kind", ["missing", "malformed", "nonobject", "missing-cwd",
+                                          "relative-cwd", "wrong-cwd", "wrong-skill", "stale",
+                                          "empty-token", "valid"])
+def test_local_dispatch_requires_current_receipt_by_default(workspace, monkeypatch, capsys, receipt_kind):
+    calls = []
+    original_read = Path.read_text
+
+    def no_skill_body(self, *args, **kwargs):
+        assert self.name != "SKILL.md", "local dispatch read a skill body"
+        return original_read(self, *args, **kwargs)
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        assert kwargs["cwd"] == workspace.resolve()
+        assert argv[:2] == ["claude", "-p"]
+        assert argv[-2:] == ["--permission-mode", "dontAsk"]
+        assert '"dispatch_id": "run-1"' in argv[2]
+        if receipt_kind != "missing":
+            data = receipt_data(workspace)
+            if receipt_kind == "malformed":
+                sd.receipt_path(workspace, "alpha").write_text('{"skill":')
+            else:
+                if receipt_kind == "nonobject":
+                    data = []
+                elif receipt_kind == "missing-cwd":
+                    del data["cwd"]
+                elif receipt_kind == "relative-cwd":
+                    data["cwd"] = "."
+                elif receipt_kind == "wrong-cwd":
+                    data["cwd"] = str(workspace.parent)
+                elif receipt_kind == "wrong-skill":
+                    data["skill"] = "beta"
+                elif receipt_kind == "stale":
+                    data["dispatch_id"] = "old-run"
+                elif receipt_kind == "empty-token":
+                    data["token"] = ""
+                write_receipt(workspace, data)
+        return subprocess.CompletedProcess(argv, 0, "edits denied or worker finished", "")
+
+    monkeypatch.setattr(sd.subprocess, "run", run)
+    monkeypatch.setattr(Path, "read_text", no_skill_body)
+    monkeypatch.setattr(sd.time, "sleep", lambda seconds: pytest.fail("default receipt check waited"))
+    result = sd.main(["dispatch", "--root", str(workspace.parent), "--task", "widgets",
+                      "--backend", "local", "--dispatch-id", "run-1"])
+    assert result == (0 if receipt_kind == "valid" else 1)
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["exit"] == 0 and plan["receipt"] is (receipt_kind == "valid")
+    assert len(calls) == 1
+
+
+def test_local_dispatch_wait_allows_receipt_after_worker_returns(workspace, monkeypatch, capsys):
+    completed = []
+    now = [0.0]
+    sleeps = []
+
+    def run(argv, **kwargs):
+        completed.append(True)
+        return subprocess.CompletedProcess(argv, 0, "done", "")
+
+    def sleep(seconds):
+        assert completed, "receipt wait ran before the local subprocess returned"
+        now[0] += seconds
+        sleeps.append(seconds)
+        write_receipt(workspace, receipt_data(workspace))
+
+    monkeypatch.setattr(sd.subprocess, "run", run)
+    monkeypatch.setattr(sd.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(sd.time, "sleep", sleep)
+    assert sd.main(["dispatch", "--root", str(workspace.parent), "--task", "widgets",
+                    "--backend", "local", "--dispatch-id", "run-1", "--wait", "1"]) == 0
+    assert json.loads(capsys.readouterr().out)["receipt"] is True
+    assert sleeps == [0.1]
+
+
+def test_local_failed_worker_does_not_wait_for_receipt(workspace, monkeypatch, capsys):
+    monkeypatch.setattr(sd.subprocess, "run", lambda argv, **kw:
+                        subprocess.CompletedProcess(argv, 7, "", "worker failed"))
+    monkeypatch.setattr(sd.time, "sleep", lambda seconds: pytest.fail("waited after a failed worker"))
+    assert sd.main(["dispatch", "--root", str(workspace.parent), "--task", "widgets",
+                    "--backend", "local", "--dispatch-id", "run-1", "--wait", "600"]) == 1
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["exit"] == 7 and plan["receipt"] is False

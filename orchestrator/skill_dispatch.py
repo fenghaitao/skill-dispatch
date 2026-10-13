@@ -453,8 +453,11 @@ def main(argv: list[str] | None = None) -> int:
             plan.update(dispatch_orca(folder, plan["prompt"], f"{skill} worker", args.model,
                                       args.ready, accept_edits=args.accept_edits,
                                       allow_tools=args.allow_tool))
-        if args.wait:
-            plan["receipt"] = wait_for_receipt(folder, skill, dispatch_id, args.wait)
+        # Local workers have finished when subprocess.run returns. A zero
+        # worker exit alone does not mean it performed any authorized work.
+        if args.backend == "local" or args.wait:
+            seconds = args.wait if plan.get("exit", 0) == 0 else 0
+            plan["receipt"] = wait_for_receipt(folder, skill, dispatch_id, seconds)
         print(json.dumps(plan, indent=2))
         return 0 if (plan.get("exit", 0) == 0 and plan.get("receipt", True)
                      and plan.get("accepted", True) is True) else 1

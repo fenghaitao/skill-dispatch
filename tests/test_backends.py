@@ -252,6 +252,13 @@ def test_main_forwards_explicit_permission_opt_ins(monkeypatch, capsys, backend)
         return {"backend": backend, **({"exit": 0} if backend == "local" else {"accepted": True})}
 
     monkeypatch.setattr(sd, f"dispatch_{backend}", dispatch)
+    if backend == "local":
+        def receipt_check(folder, skill, dispatch_id, seconds):
+            assert folder == (WORKSPACES / "data-tools").resolve()
+            assert skill == "summarize-csv" and seconds == 0
+            return True
+
+        monkeypatch.setattr(sd, "wait_for_receipt", receipt_check)
     assert sd.main(["dispatch", "--root", str(WORKSPACES), "--task", "Summarize sales.csv",
                     "--backend", backend, "--accept-edits", "--allow-tool", "Read",
                     "--allow-tool", "Bash(python3 -m pytest -q)"]) == 0
