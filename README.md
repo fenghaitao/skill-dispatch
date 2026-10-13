@@ -34,7 +34,7 @@ skill-dispatch/
    no match fails closed and asks for an explicit skill.
 3. **Capture Git identity.** Before dispatch, require the selected
    `SKILL.md` to be tracked and clean. Record the workspace repository commit
-  . This naturally fits the intended
+   and the repository-relative skill path. This naturally fits the intended
    deployment where each workspace is a Git submodule.
 4. **Dispatch.** Start the worker with the selected workspace as its cwd and
    tell it to use the selected skill.
@@ -97,7 +97,8 @@ For a selected skill, dispatch records approximately:
 
 The selected `SKILL.md` must have no staged or unstaged changes when the
 worker starts. Other workspace files may already be dirty or may be changed by
-the worker. The restriction exists only so `repo_commit + skill_repo_path` accurately identifies\nthe instructions Claude will see.
+the worker. The restriction exists only so `repo_commit + skill_repo_path`
+accurately identifies the instructions Claude will see.
 
 No later verify step is required. If a caller wants provenance, it should store
 this plan next to the backend's session metadata or rely on the backend's own
