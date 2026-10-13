@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Discover the skills of several folders and dispatch work to an agent in the right one.
 
-Discovery, routing and dispatch read only each skill's frontmatter (name and
-description). They pick the folder whose skill fits the task and start a
-worker agent *in that folder*, so the worker finds the skill locally.
-The separate verify command intentionally reads skill bodies to check tokens.
+Discovery and routing parse only each skill's frontmatter (name and
+description). Dispatch additionally records the selected skill's Git commit
+and blob identity, without interpreting its body. It picks the folder whose
+skill fits the task and starts a worker agent *in that folder*, so the worker
+finds the skill locally.
 
     skill_dispatch.py discover --root <dir>
     skill_dispatch.py route    --root <dir> --task "..." [--skill NAME]
@@ -21,11 +22,12 @@ Backends:
   herdr  open a background tab in the caller's Herdr workspace and start Claude
          through the agent API; wait for readiness before submitting the task.
 
-A skill may ask the worker to write `.skill-receipts/<skill>.json` holding a
-token that appears only in the skill's body. Dispatch supplies a dispatch ID;
-the worker must include it in an atomically written receipt. Verify checks
-the token, skill, absolute working directory and requested dispatch ID.
-Receipts are evidence of following instructions, not proof of task completion.
+The dispatcher itself asks the worker to atomically write
+`.skill-receipts/<skill>.json`. Existing skills do not need dispatcher-specific
+instructions or tokens. The receipt carries the dispatch ID plus the Git commit
+and blob identity captured before launch. Verify checks the receipt against Git
+and confirms that the selected skill still has the same content.
+Receipts are evidence of dispatch completion, not proof that task output is correct.
 """
 from __future__ import annotations
 
@@ -174,15 +176,24 @@ def validate_dispatch_id(dispatch_id: str) -> str:
     return dispatch_id
 
 
-def prompt_for(task: str, skill: str, dispatch_id: str | None = None) -> str:
+def prompt_for(task: str, skill: str, dispatch_id: str | None = None,
+               git_identity: dict | None = None) -> str:
     instruction = (f"Use the `{skill}` skill from this folder for the following task. "
-                   "Follow the skill's steps exactly, including any receipt it asks for.")
+                   "Follow the skill's steps exactly.")
     if dispatch_id is not None:
         validate_dispatch_id(dispatch_id)
-        instruction += (f' Include "dispatch_id": "{dispatch_id}" in the receipt, '
-                        "along with the skill, token and absolute cwd. Write the complete JSON "
-                        "to a temporary file in the receipt directory and atomically rename it "
-                        "to the receipt path after completing the task.")
+        if git_identity is None:
+            raise DispatchError("Git identity is required for a dispatched task")
+        receipt = f"{RECEIPTS}/{skill}.json"
+        instruction += (
+            f" After completing the task, write dispatcher receipt `{receipt}` as JSON with "
+            f'"skill": "{skill}", "cwd": "<absolute cwd>", '
+            f'"dispatch_id": "{dispatch_id}", '
+            f'"repo_commit": "{git_identity["repo_commit"]}", and '
+            f'"skill_blob": "{git_identity["skill_blob"]}". '
+            "Write the complete JSON to a temporary file in the receipt directory and "
+            "atomically rename it to the receipt path. This receipt instruction comes from "
+            "the dispatcher; do not modify the skill to add it.")
     return f"{instruction}\n\nTask: {task}"
 
 
@@ -190,6 +201,44 @@ def prompt_for(task: str, skill: str, dispatch_id: str | None = None) -> str:
 
 def _run(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True, **kwargs)
+
+
+def _git_result(folder: Path, *args: str, timeout: float = 30) -> tuple[int, str, str]:
+    """Run Git without a shell; kept separate from worker subprocess mocks."""
+    argv = ["git", "-C", str(folder.resolve()), *args]
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.communicate()
+        raise DispatchError(f"git {' '.join(args[:2])}: timed out") from exc
+    return process.returncode, stdout.strip(), stderr.strip()
+
+
+def _git(folder: Path, *args: str) -> str:
+    code, stdout, stderr = _git_result(folder, *args)
+    if code != 0:
+        raise DispatchError(f"git {' '.join(args[:2])}: {stderr or stdout or f'exit {code}'}")
+    return stdout
+
+
+def skill_git_identity(folder: Path, skill: dict) -> dict:
+    """Committed identity of the selected skill; dirty skill content is refused."""
+    repo_root = Path(_git(folder, "rev-parse", "--show-toplevel")).resolve()
+    skill_path = (folder.resolve() / skill["file"]).resolve()
+    try:
+        repo_path = skill_path.relative_to(repo_root).as_posix()
+    except ValueError as exc:
+        raise DispatchError(f"selected skill is outside its Git repository: {skill_path}") from exc
+    _git(repo_root, "ls-files", "--error-unmatch", "--", repo_path)
+    dirty = _git(repo_root, "status", "--porcelain=v1", "--", repo_path)
+    if dirty:
+        raise DispatchError(f"{skill_path}: selected skill has uncommitted changes; commit it first")
+    commit = _git(repo_root, "rev-parse", "HEAD")
+    blob = _git(repo_root, "rev-parse", f"HEAD:{repo_path}")
+    return {"repo_root": str(repo_root), "repo_commit": commit,
+            "skill_blob": blob, "skill_repo_path": repo_path}
 
 
 def _orca(*args: str, timeout: float = 30) -> dict:
@@ -445,14 +494,16 @@ def dispatch_herdr(folder: Path, prompt: str, title: str, model: str | None,
             "agent": name, "accepted": True, "activity_observed": True, "send": sent}
 
 
-def wait_for_receipt(folder: Path, skill: str, dispatch_id: str, seconds: float) -> bool:
-    """Wait for a complete receipt for this dispatch without reading skill bodies."""
+def wait_for_receipt(folder: Path, skill: str, dispatch_id: str, seconds: float,
+                     git_identity: dict | None = None) -> bool:
+    """Wait for a complete receipt for this dispatch without parsing skill bodies."""
     validate_dispatch_id(dispatch_id)
     validate_seconds(seconds)
     deadline = time.monotonic() + seconds
     while True:
         data, _ = read_receipt(folder, skill)
-        if data is not None and all(receipt_identity(data, folder, skill, dispatch_id).values()):
+        if data is not None and all(
+                receipt_identity(data, folder, skill, dispatch_id, git_identity).values()):
             return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -460,9 +511,7 @@ def wait_for_receipt(folder: Path, skill: str, dispatch_id: str, seconds: float)
         time.sleep(min(0.1, remaining))
 
 
-# -- Verification (reads skill bodies; run only after dispatch) ---------------
-
-TOKEN = re.compile(r'"token":\s*"([^"]+)"')
+# -- Verification -------------------------------------------------------------
 
 
 def receipt_path(folder: Path, skill: str) -> Path:
@@ -491,19 +540,39 @@ def read_receipt(folder: Path, skill: str) -> tuple[dict | None, str]:
         return None, "unreadable receipt"
     if (not isinstance(data, dict) or
             any(not isinstance(data.get(key), str) or not data[key].strip()
-                for key in ("skill", "token", "cwd", "dispatch_id")) or
+                for key in ("skill", "cwd", "dispatch_id", "repo_commit", "skill_blob")) or
             not Path(data["cwd"]).is_absolute()):
         return None, "invalid receipt"
     return data, "readable"
 
 
-def receipt_identity(data: dict, folder: Path, skill: str, dispatch_id: str) -> dict[str, bool]:
+def receipt_identity(data: dict, folder: Path, skill: str, dispatch_id: str,
+                     git_identity: dict | None = None) -> dict[str, bool]:
     try:
         cwd_matches = Path(data["cwd"]).resolve() == folder.resolve()
     except (OSError, RuntimeError, ValueError):
         cwd_matches = False
-    return {"cwd": cwd_matches, "identity": data["skill"] == skill,
-            "dispatch": data["dispatch_id"] == dispatch_id}
+    checks = {"cwd": cwd_matches, "identity": data["skill"] == skill,
+              "dispatch": data["dispatch_id"] == dispatch_id}
+    if git_identity is not None:
+        checks["repo_commit"] = data["repo_commit"] == git_identity["repo_commit"]
+        checks["skill_blob"] = data["skill_blob"] == git_identity["skill_blob"]
+    return checks
+
+
+def receipt_git_checks(data: dict, folder: Path, skill: dict) -> dict[str, bool]:
+    """Check that the receipt names a real commit containing this unchanged skill."""
+    try:
+        repo_root = Path(_git(folder, "rev-parse", "--show-toplevel")).resolve()
+        skill_path = (folder.resolve() / skill["file"]).resolve()
+        repo_path = skill_path.relative_to(repo_root).as_posix()
+        commit_blob = _git(repo_root, "rev-parse", f"{data['repo_commit']}:{repo_path}")
+        code, _, _ = _git_result(repo_root, "diff", "--quiet", data["repo_commit"],
+                                 "--", repo_path)
+    except (DispatchError, OSError, RuntimeError, ValueError):
+        return {"repo_commit": False, "skill_blob": False, "skill_current": False}
+    return {"repo_commit": True, "skill_blob": commit_blob == data["skill_blob"],
+            "skill_current": code == 0}
 
 
 def verify(root: Path, dispatch_id: str, skills: list[str] | None = None) -> list[dict]:
@@ -525,13 +594,8 @@ def verify(root: Path, dispatch_id: str, skills: list[str] | None = None) -> lis
         if data is None:
             results.append({"skill": skill["name"], "state": state})
             continue
-        try:
-            expected = TOKEN.search((base / skill["file"]).read_text(encoding="utf-8"))
-        except (OSError, UnicodeError):
-            results.append({"skill": skill["name"], "state": "unreadable skill"})
-            continue
-        checks = {"token": bool(expected) and data["token"] == expected.group(1),
-                  **receipt_identity(data, base, skill["name"], dispatch_id)}
+        checks = {**receipt_identity(data, base, skill["name"], dispatch_id),
+                  **receipt_git_checks(data, base, skill)}
         results.append({"skill": skill["name"], "state": "ok" if all(checks.values()) else "mismatch",
                         **checks})
     return results
@@ -576,12 +640,17 @@ def main(argv: list[str] | None = None) -> int:
         choice = route(discover(args.root), args.task, args.skill)
         folder = Path(choice["folder"]["path"])
         skill = choice["skill"]["name"]
-        dispatch_id = (args.dispatch_id or uuid.uuid4().hex) if args.command == "dispatch" else None
+        if args.command == "route":
+            plan = {"folder": str(folder), "skill": skill, "score": choice["score"],
+                    "prompt": prompt_for(args.task, skill)}
+            print(json.dumps(plan, indent=2))
+            return 0
+        dispatch_id = args.dispatch_id or uuid.uuid4().hex
+        git_identity = skill_git_identity(folder, choice["skill"])
         plan = {"folder": str(folder), "skill": skill, "score": choice["score"],
-                "prompt": prompt_for(args.task, skill, dispatch_id)}
-        if dispatch_id is not None:
-            plan["dispatch_id"] = dispatch_id
-        if args.command == "route" or args.backend == "print":
+                "prompt": prompt_for(args.task, skill, dispatch_id, git_identity),
+                "dispatch_id": dispatch_id, **git_identity}
+        if args.backend == "print":
             print(json.dumps(plan, indent=2))
             return 0
         if args.backend == "local":
@@ -596,7 +665,7 @@ def main(argv: list[str] | None = None) -> int:
         # worker exit alone does not mean it performed any authorized work.
         if args.backend == "local" or args.wait:
             seconds = args.wait if plan.get("exit", 0) == 0 else 0
-            plan["receipt"] = wait_for_receipt(folder, skill, dispatch_id, seconds)
+            plan["receipt"] = wait_for_receipt(folder, skill, dispatch_id, seconds, git_identity)
         print(json.dumps(plan, indent=2))
         return 0 if (plan.get("exit", 0) == 0 and plan.get("receipt", True)
                      and plan.get("accepted", True) is True) else 1
