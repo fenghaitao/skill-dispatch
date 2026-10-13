@@ -132,13 +132,17 @@ def test_print_backend_shows_the_plan_without_starting_an_agent(capsys, monkeypa
 def test_verify_checks_receipt_token_and_folder(tmp_path):
     folder = tmp_path / "a"
     _skill(folder, "alpha", "does alpha", body='{"skill": "alpha", "token": "tok-1", "cwd": "<pwd>"}')
-    assert sd.verify(tmp_path) == [{"skill": "alpha", "state": "no receipt"}]
+    assert sd.verify(tmp_path, "run-1") == [{"skill": "alpha", "state": "no receipt"}]
     receipt = folder / sd.RECEIPTS / "alpha.json"
     receipt.parent.mkdir()
-    receipt.write_text(json.dumps({"skill": "alpha", "token": "tok-1", "cwd": str(folder)}))
-    assert sd.verify(tmp_path)[0]["state"] == "ok"
-    receipt.write_text(json.dumps({"skill": "alpha", "token": "guess", "cwd": str(folder)}))
-    assert sd.verify(tmp_path)[0] == {"skill": "alpha", "state": "mismatch", "token": False, "cwd": True}
+    receipt.write_text(json.dumps({"skill": "alpha", "token": "tok-1", "cwd": str(folder),
+                                   "dispatch_id": "run-1"}))
+    assert sd.verify(tmp_path, "run-1")[0]["state"] == "ok"
+    receipt.write_text(json.dumps({"skill": "alpha", "token": "guess", "cwd": str(folder),
+                                   "dispatch_id": "run-1"}))
+    assert sd.verify(tmp_path, "run-1")[0] == {
+        "skill": "alpha", "state": "mismatch", "token": False,
+        "cwd": True, "identity": True, "dispatch": True}
 
 
 @pytest.mark.parametrize("description, expected", [

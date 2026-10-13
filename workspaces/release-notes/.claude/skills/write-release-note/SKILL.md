@@ -17,7 +17,9 @@ House format, newest release first:
 2. Write the receipt `.skill-receipts/write-release-note.json`:
 
    ```json
-   {"skill": "write-release-note", "token": "notes-2c8e55", "cwd": "<output of pwd>"}
+   {"skill": "write-release-note", "token": "notes-2c8e55", "cwd": "<output of pwd>", "dispatch_id": "<dispatch ID from request>"}
    ```
 
 The token above only appears in this file. Copy it exactly.
+Include the dispatch ID from the request. Write complete JSON to a temporary
+file in `.skill-receipts/`, then atomically rename it to the receipt path.

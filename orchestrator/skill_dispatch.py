@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Discover the skills of several folders and dispatch work to an agent in the right one.
 
-The orchestrator never loads a folder's skills. It reads only each skill's
-frontmatter (name and description) to build a catalog, picks the folder whose
-skill fits the task, and starts a worker agent *in that folder*, so the
-worker's own session finds the skill there.
+Discovery, routing and dispatch read only each skill's frontmatter (name and
+description). They pick the folder whose skill fits the task and start a
+worker agent *in that folder*, so the worker finds the skill locally.
+The separate verify command intentionally reads skill bodies to check tokens.
 
     skill_dispatch.py discover --root <dir>
     skill_dispatch.py route    --root <dir> --task "..." [--skill NAME]
     skill_dispatch.py dispatch --root <dir> --task "..." [--skill NAME]
                                [--backend print|local|orca] [--model M] [--wait SECONDS]
-    skill_dispatch.py verify   --root <dir>
+    skill_dispatch.py verify   --root <dir> --dispatch-id ID [--skill NAME ...]
 
 Backends:
   print  show the plan only;
@@ -20,9 +20,10 @@ Backends:
          names the waiting tab and sends the task once the agent is ready.
 
 A skill may ask the worker to write `.skill-receipts/<skill>.json` holding a
-token that appears only in the skill's body. `verify` checks those receipts:
-a matching token shows the worker read the skill itself, which the
-orchestrator never did.
+token that appears only in the skill's body. Dispatch supplies a dispatch ID;
+the worker must include it in an atomically written receipt. Verify checks
+the token, skill, absolute working directory and requested dispatch ID.
+Receipts are evidence of following instructions, not proof of task completion.
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ import shlex
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import yaml
@@ -42,6 +44,7 @@ SKILL_GLOB = ".claude/skills/*/SKILL.md"
 RECEIPTS = ".skill-receipts"
 MAX_FRONTMATTER_BYTES = 16 * 1024
 SKILL_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+DISPATCH_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 class DispatchError(Exception):
@@ -158,9 +161,22 @@ def route(catalog: dict, task: str, skill: str | None = None) -> dict:
     return {"folder": folder, "skill": entry, "score": score}
 
 
-def prompt_for(task: str, skill: str) -> str:
-    return (f"Use the `{skill}` skill from this folder for the following task. "
-            f"Follow the skill's steps exactly, including any receipt it asks for.\n\nTask: {task}")
+def validate_dispatch_id(dispatch_id: str) -> str:
+    if not isinstance(dispatch_id, str) or not DISPATCH_ID.fullmatch(dispatch_id):
+        raise DispatchError("dispatch ID must be 1-128 letters, digits, dots, underscores or hyphens")
+    return dispatch_id
+
+
+def prompt_for(task: str, skill: str, dispatch_id: str | None = None) -> str:
+    instruction = (f"Use the `{skill}` skill from this folder for the following task. "
+                   "Follow the skill's steps exactly, including any receipt it asks for.")
+    if dispatch_id is not None:
+        validate_dispatch_id(dispatch_id)
+        instruction += (f' Include "dispatch_id": "{dispatch_id}" in the receipt, '
+                        "along with the skill, token and absolute cwd. Write the complete JSON "
+                        "to a temporary file in the receipt directory and atomically rename it "
+                        "to the receipt path after completing the task.")
+    return f"{instruction}\n\nTask: {task}"
 
 
 # -- Dispatch ----------------------------------------------------------------
@@ -288,14 +304,19 @@ def dispatch_local(folder: Path, prompt: str, model: str | None, *,
             "output": (result.stdout or result.stderr).strip()[-2000:]}
 
 
-def wait_for_receipt(folder: Path, skill: str, seconds: float) -> bool:
-    receipt = receipt_path(folder, skill)
+def wait_for_receipt(folder: Path, skill: str, dispatch_id: str, seconds: float) -> bool:
+    """Wait for a complete receipt for this dispatch without reading skill bodies."""
+    validate_dispatch_id(dispatch_id)
+    validate_seconds(seconds)
     deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        if receipt.is_file():
+    while True:
+        data, _ = read_receipt(folder, skill)
+        if data is not None and all(receipt_identity(data, folder, skill, dispatch_id).values()):
             return True
-        time.sleep(5)
-    return receipt.is_file()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.1, remaining))
 
 
 # -- Verification (reads skill bodies; run only after dispatch) ---------------
@@ -308,30 +329,70 @@ def receipt_path(folder: Path, skill: str) -> Path:
     validate_skill_name(skill)
     directory = folder.resolve() / RECEIPTS
     receipt = directory / f"{skill}.json"
-    if not receipt.resolve().is_relative_to(directory):
+    try:
+        contained = receipt.resolve().is_relative_to(directory)
+    except (OSError, RuntimeError) as exc:
+        raise DispatchError(f"cannot resolve receipt path: {receipt}") from exc
+    if not contained:
         raise DispatchError(f"receipt path escapes {directory}: {receipt}")
     return receipt
 
 
-def verify(root: Path) -> list[dict]:
+def read_receipt(folder: Path, skill: str) -> tuple[dict | None, str]:
+    receipt = receipt_path(folder, skill)
+    if not receipt.is_file():
+        return None, "no receipt"
+    try:
+        data = json.loads(receipt.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, "no receipt"
+    except (ValueError, UnicodeError, OSError):
+        return None, "unreadable receipt"
+    if (not isinstance(data, dict) or
+            any(not isinstance(data.get(key), str) or not data[key].strip()
+                for key in ("skill", "token", "cwd", "dispatch_id")) or
+            not Path(data["cwd"]).is_absolute()):
+        return None, "invalid receipt"
+    return data, "readable"
+
+
+def receipt_identity(data: dict, folder: Path, skill: str, dispatch_id: str) -> dict[str, bool]:
+    try:
+        cwd_matches = Path(data["cwd"]).resolve() == folder.resolve()
+    except (OSError, RuntimeError, ValueError):
+        cwd_matches = False
+    return {"cwd": cwd_matches, "identity": data["skill"] == skill,
+            "dispatch": data["dispatch_id"] == dispatch_id}
+
+
+def verify(root: Path, dispatch_id: str, skills: list[str] | None = None) -> list[dict]:
+    """Require receipts for selected skills (all discovered skills by default)."""
+    validate_dispatch_id(dispatch_id)
+    entries = [(folder, skill) for folder in discover(root)["folders"] for skill in folder["skills"]]
+    if skills is not None:
+        wanted = {validate_skill_name(name) for name in skills}
+        unknown = wanted - {skill["name"] for _, skill in entries}
+        if unknown:
+            raise DispatchError(f"no folder has skills named {sorted(unknown)}")
+        entries = [(folder, skill) for folder, skill in entries if skill["name"] in wanted]
+    if not entries:
+        raise DispatchError("no skills to verify")
     results = []
-    for folder in discover(root)["folders"]:
+    for folder, skill in entries:
         base = Path(folder["path"])
-        for skill in folder["skills"]:
-            receipt = receipt_path(base, skill["name"])
-            if not receipt.is_file():
-                results.append({"skill": skill["name"], "state": "no receipt"})
-                continue
+        data, state = read_receipt(base, skill["name"])
+        if data is None:
+            results.append({"skill": skill["name"], "state": state})
+            continue
+        try:
             expected = TOKEN.search((base / skill["file"]).read_text(encoding="utf-8"))
-            try:
-                data = json.loads(receipt.read_text(encoding="utf-8"))
-            except ValueError:
-                results.append({"skill": skill["name"], "state": "unreadable receipt"})
-                continue
-            ok_token = bool(expected) and data.get("token") == expected.group(1)
-            ok_cwd = Path(str(data.get("cwd", ""))).resolve() == base.resolve()
-            results.append({"skill": skill["name"], "state": "ok" if ok_token and ok_cwd else "mismatch",
-                            "token": ok_token, "cwd": ok_cwd})
+        except (OSError, UnicodeError):
+            results.append({"skill": skill["name"], "state": "unreadable skill"})
+            continue
+        checks = {"token": bool(expected) and data["token"] == expected.group(1),
+                  **receipt_identity(data, base, skill["name"], dispatch_id)}
+        results.append({"skill": skill["name"], "state": "ok" if all(checks.values()) else "mismatch",
+                        **checks})
     return results
 
 
@@ -346,6 +407,11 @@ def main(argv: list[str] | None = None) -> int:
         if name in ("route", "dispatch"):
             p.add_argument("--task", required=True)
             p.add_argument("--skill")
+        if name in ("dispatch", "verify"):
+            p.add_argument("--dispatch-id", required=name == "verify",
+                           help="unique ID for this dispatch; generated if omitted on dispatch")
+        if name == "verify":
+            p.add_argument("--skill", action="append", help="require receipts only for these skills; repeatable")
         if name == "dispatch":
             p.add_argument("--backend", choices=("print", "local", "orca"), default="print")
             p.add_argument("--model")
@@ -354,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--allow-tool", action="append", default=[], metavar="RULE",
                            help="opt in to automatic approval of a Claude tool rule; repeatable")
             p.add_argument("--wait", type=seconds_argument, default=0,
-                           help="seconds to wait for the skill's receipt (orca backend)")
+                           help="seconds to wait for a complete receipt for this dispatch")
             p.add_argument("--ready", type=seconds_argument, default=600,
                            help="seconds to wait for the worker to be ready (orca backend)")
     args = parser.parse_args(argv)
@@ -363,14 +429,17 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(discover(args.root), indent=2))
             return 0
         if args.command == "verify":
-            results = verify(args.root)
+            results = verify(args.root, args.dispatch_id, args.skill)
             print(json.dumps(results, indent=2))
-            return 0 if all(r["state"] in ("ok", "no receipt") for r in results) else 1
+            return 0 if results and all(r["state"] == "ok" for r in results) else 1
         choice = route(discover(args.root), args.task, args.skill)
         folder = Path(choice["folder"]["path"])
         skill = choice["skill"]["name"]
+        dispatch_id = (args.dispatch_id or uuid.uuid4().hex) if args.command == "dispatch" else None
         plan = {"folder": str(folder), "skill": skill, "score": choice["score"],
-                "prompt": prompt_for(args.task, skill)}
+                "prompt": prompt_for(args.task, skill, dispatch_id)}
+        if dispatch_id is not None:
+            plan["dispatch_id"] = dispatch_id
         if args.command == "route" or args.backend == "print":
             print(json.dumps(plan, indent=2))
             return 0
@@ -381,8 +450,8 @@ def main(argv: list[str] | None = None) -> int:
             plan.update(dispatch_orca(folder, plan["prompt"], f"{skill} worker", args.model,
                                       args.ready, accept_edits=args.accept_edits,
                                       allow_tools=args.allow_tool))
-            if args.wait:
-                plan["receipt"] = wait_for_receipt(folder, skill, args.wait)
+        if args.wait:
+            plan["receipt"] = wait_for_receipt(folder, skill, dispatch_id, args.wait)
         print(json.dumps(plan, indent=2))
         return 0 if (plan.get("exit", 0) == 0 and plan.get("receipt", True)
                      and plan.get("accepted", True) is True) else 1

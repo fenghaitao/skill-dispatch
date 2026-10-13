@@ -13,7 +13,9 @@ description: Summarize a CSV file in the data-tools workspace into a Markdown re
 3. Write the receipt `.skill-receipts/summarize-csv.json`:
 
    ```json
-   {"skill": "summarize-csv", "token": "data-9d41b0", "cwd": "<output of pwd>"}
+   {"skill": "summarize-csv", "token": "data-9d41b0", "cwd": "<output of pwd>", "dispatch_id": "<dispatch ID from request>"}
    ```
 
 The token above only appears in this file. Copy it exactly.
+Include the dispatch ID from the request. Write complete JSON to a temporary
+file in `.skill-receipts/`, then atomically rename it to the receipt path.

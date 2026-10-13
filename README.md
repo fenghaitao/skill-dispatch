@@ -29,10 +29,15 @@ skill-dispatch/
    - `local`: `claude -p` as a subprocess in the folder;
    - `orca`: register the folder with Orca, open a terminal there, start
      `claude`, wait until it is ready, then send the task.
-4. **Verify.** Each demo skill tells the worker to write
-   `.skill-receipts/<skill>.json` with a token that appears only in the skill
-   body, and the working directory. A matching token and folder show that the
-   worker read the skill from its own folder.
+4. **Verify.** Each demo skill tells the worker to atomically write
+   `.skill-receipts/<skill>.json` with its skill name, a token from the skill
+   body, the absolute working directory, and the dispatch ID supplied in the
+   prompt. The separate `verify` command intentionally reads skill bodies to
+   check tokens. It requires `--dispatch-id ID` and fails for missing, invalid,
+   stale or mismatched receipts. It checks every discovered skill by default;
+   repeat `--skill NAME` to require only the skills dispatched in that run.
+   Receipts provide evidence that instructions were followed; they do not
+   prove that the requested work is correct or complete.
 
 ## Usage
 
@@ -41,8 +46,8 @@ Install the runtime dependency with `python3 -m pip install -r requirements.txt`
 ```bash
 python3 orchestrator/skill_dispatch.py discover --root workspaces
 python3 orchestrator/skill_dispatch.py route --root workspaces --task "Summarize sales.csv"
-python3 orchestrator/skill_dispatch.py dispatch --root <dir> --task "..." --backend local
-python3 orchestrator/skill_dispatch.py verify --root <dir>
+python3 orchestrator/skill_dispatch.py dispatch --root <dir> --task "..." --backend local --dispatch-id example-run
+python3 orchestrator/skill_dispatch.py verify --root <dir> --dispatch-id example-run --skill <selected-skill>
 
 scripts/demo.sh local /tmp/sd-demo        # MODEL=claude-haiku-5-5 for cheap workers
 scripts/demo.sh orca  /tmp/sd-demo
@@ -66,6 +71,21 @@ Bare tool names such as `--allow-tool Bash` grant broad approvals and should be
 chosen deliberately. A working directory is not a filesystem sandbox; use a
 container or other isolation when workers must not access other folders.
 The dispatcher never answers a trust prompt, including with either opt-in flag.
+
+## Receipt IDs and waiting
+
+Dispatch generates a fresh ID if `--dispatch-id` is omitted and includes it in
+the JSON plan and worker prompt. Use a unique ID for each run; never reuse an ID
+for a different task in the same workspace. Record the generated ID, or supply
+your own unique ID when coordinating dispatch and verification.
+Legacy receipts without a dispatch ID fail validation.
+
+`--wait SECONDS` waits for complete receipt JSON with the selected skill, absolute
+folder and current dispatch ID. Waiting does not read skill bodies or check the
+secret token; run `verify` afterward to check the token. A send acknowledgement
+proves input acceptance, not a started turn; Orca delivery metadata and warnings
+are retained in the output. Readiness and receipt wait durations must be finite
+and nonnegative. `--ready` applies only to Orca startup and never answers a prompt.
 
 ## Findings
 
