@@ -2,8 +2,8 @@
 """Discover the skills of several folders and dispatch work to an agent in the right one.
 
 Discovery and routing parse only each skill's frontmatter (name and
-description). Dispatch records the selected skill's Git commit and blob
-identity, then starts a worker agent *in that folder*, so the worker finds the
+description). Dispatch records the selected workspace's Git commit, then starts
+a worker agent *in that folder*, so the worker finds the
 skill locally. Execution lifecycle and history belong to the backend session.
 
     skill_dispatch.py discover --root <dir>
@@ -207,9 +207,8 @@ def skill_git_identity(folder: Path, skill: dict) -> dict:
     if dirty:
         raise DispatchError(f"{skill_path}: selected skill has uncommitted changes; commit it first")
     commit = _git(repo_root, "rev-parse", "HEAD")
-    blob = _git(repo_root, "rev-parse", f"HEAD:{repo_path}")
     return {"repo_root": str(repo_root), "repo_commit": commit,
-            "skill_blob": blob, "skill_repo_path": repo_path}
+            "skill_repo_path": repo_path}
 
 
 def _orca(*args: str, timeout: float = 30) -> dict:
