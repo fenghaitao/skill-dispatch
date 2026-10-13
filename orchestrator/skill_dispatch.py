@@ -45,6 +45,7 @@ RECEIPTS = ".skill-receipts"
 MAX_FRONTMATTER_BYTES = 16 * 1024
 SKILL_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 DISPATCH_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+ORCA_WAIT_MARGIN_SECONDS = 5
 
 
 class DispatchError(Exception):
@@ -269,26 +270,38 @@ def dispatch_orca(folder: Path, prompt: str, title: str, model: str | None,
     # it says which tab is waiting and keeps waiting for the agent to be ready.
     deadline = time.monotonic() + ready_seconds
     noticed = None
+
+    def readiness_error() -> DispatchError:
+        return DispatchError(f"claude in {terminal} did not become ready"
+                             f"{f' (blocked on {noticed})' if noticed else ''}; task not sent")
+
     while True:
         remaining = deadline - time.monotonic()
         if remaining < 0.001:
-            raise DispatchError(f"claude in {terminal} did not become ready"
-                                f"{f' (blocked on {noticed})' if noticed else ''}; task not sent")
-        wait = _orca("terminal", "wait", "--terminal", terminal, "--for", "tui-idle",
-                     "--timeout-ms", str(min(30000, int(remaining * 1000))), timeout=remaining)
+            raise readiness_error()
+        wait_ms = min(30000, int(remaining * 1000))
+        try:
+            # Let Orca finish its wait and return the blocked reason before
+            # subprocess.run kills it. The margin never extends eligibility
+            # to send: deadline checks still reject late readiness results.
+            wait = _orca("terminal", "wait", "--terminal", terminal, "--for", "tui-idle",
+                         "--timeout-ms", str(wait_ms),
+                         timeout=wait_ms / 1000 + ORCA_WAIT_MARGIN_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise readiness_error() from exc
         wait = wait.get("wait") or wait
-        if time.monotonic() >= deadline:
-            raise DispatchError(f"claude in {terminal} exceeded readiness budget; task not sent")
-        if wait.get("satisfied") is True:
-            break
         reason = wait.get("blockedReason")
         if reason and reason != noticed:
             print(f"waiting: Orca tab {title!r} ({terminal}) is blocked on {reason}; "
                   f"answer it there", file=sys.stderr, flush=True)
             noticed = reason
+        if time.monotonic() >= deadline:
+            raise readiness_error()
+        if wait.get("satisfied") is True:
+            break
         time.sleep(min(0.1, max(0, deadline - time.monotonic())))
     if time.monotonic() >= deadline:
-        raise DispatchError(f"claude in {terminal} exceeded readiness budget; task not sent")
+        raise readiness_error()
     sent = _orca("terminal", "send", "--terminal", terminal, "--text", prompt, "--enter")
     send = sent.get("send") or sent
     if not isinstance(send, dict) or send.get("accepted") is not True:

@@ -158,12 +158,12 @@ def test_orca_ready_deadline_bounds_wait_and_prevents_late_send(tmp_path, monkey
     def handler(args, kwargs, clock):
         assert args[:2] == ("terminal", "wait")
         assert args[-2:] == ("--timeout-ms", "1000")
-        assert kwargs["timeout"] == 1
+        assert kwargs["timeout"] == 1 + sd.ORCA_WAIT_MARGIN_SECONDS
         clock.now = 1.01
         return {"wait": {"satisfied": satisfied}}
 
     _, calls = mock_orca_launch(monkeypatch, tmp_path, handler)
-    with pytest.raises(sd.DispatchError, match="budget"):
+    with pytest.raises(sd.DispatchError, match="did not become ready"):
         sd.dispatch_orca(tmp_path, "task", "worker", None, 1)
     assert not any(args[:2] == ("terminal", "send") for args, _ in calls)
 
@@ -173,7 +173,7 @@ def test_orca_hung_wait_has_subprocess_timeout(tmp_path, monkeypatch):
         raise subprocess.TimeoutExpired("orca", kwargs["timeout"])
 
     _, calls = mock_orca_launch(monkeypatch, tmp_path, handler)
-    with pytest.raises(subprocess.TimeoutExpired):
+    with pytest.raises(sd.DispatchError, match="did not become ready.*task not sent"):
         sd.dispatch_orca(tmp_path, "task", "worker", None, 1)
     assert len(calls) == 2
 
@@ -263,3 +263,54 @@ def test_main_forwards_explicit_permission_opt_ins(monkeypatch, capsys, backend)
                     "--backend", backend, "--accept-edits", "--allow-tool", "Read",
                     "--allow-tool", "Bash(python3 -m pytest -q)"]) == 0
     capsys.readouterr()
+
+
+@pytest.mark.parametrize("transport_timeout", [False, True])
+def test_orca_blocked_at_deadline_reports_reason_without_sending(monkeypatch, capsys, transport_timeout):
+    folder = WORKSPACES / "data-tools"
+    waits = []
+
+    def handler(args, kwargs, clock):
+        assert args[:2] == ("terminal", "wait"), "sent a task to a blocked worker"
+        wait_ms = int(args[-1])
+        assert kwargs["timeout"] == wait_ms / 1000 + sd.ORCA_WAIT_MARGIN_SECONDS
+        waits.append(wait_ms)
+        if len(waits) == 1:
+            clock.now = 0.25
+            return {"wait": {"satisfied": False, "blockedReason": "agent-cwd-prompt"}}
+        clock.now = 1 + (sd.ORCA_WAIT_MARGIN_SECONDS if transport_timeout else 0) + 0.01
+        if transport_timeout:
+            raise subprocess.TimeoutExpired("orca", kwargs["timeout"])
+        return {"wait": {"satisfied": False, "blockedReason": "agent-cwd-prompt"}}
+
+    _, calls = mock_orca_launch(monkeypatch, folder, handler)
+    assert sd.main(["dispatch", "--root", str(WORKSPACES), "--task", "Summarize sales.csv",
+                    "--backend", "orca", "--ready", "1"]) == 2
+    captured = capsys.readouterr()
+    error = json.loads(captured.out)["error"]
+    assert error == "claude in worker-handle did not become ready (blocked on agent-cwd-prompt); task not sent"
+    assert "blocked on agent-cwd-prompt" in captured.err
+    assert len(waits) == 2 and waits[1] < waits[0]
+    assert not any(args[:2] == ("terminal", "send") for args, _ in calls)
+
+
+def test_orca_final_wait_preserves_new_blocked_reason(tmp_path, monkeypatch):
+    def handler(args, kwargs, clock):
+        clock.now = 1.01
+        return {"wait": {"satisfied": False, "blockedReason": "agent-cwd-prompt"}}
+
+    mock_orca_launch(monkeypatch, tmp_path, handler)
+    with pytest.raises(sd.DispatchError, match=r"did not become ready \(blocked on agent-cwd-prompt\)"):
+        sd.dispatch_orca(tmp_path, "task", "worker", None, 1)
+
+
+def test_orca_subprocess_margin_is_based_on_wait_chunk(tmp_path, monkeypatch):
+    def handler(args, kwargs, clock):
+        if args[:2] == ("terminal", "wait"):
+            assert args[-2:] == ("--timeout-ms", "30000")
+            assert kwargs["timeout"] == 30 + sd.ORCA_WAIT_MARGIN_SECONDS
+            return {"wait": {"satisfied": True}}
+        return {"send": {"accepted": True}}
+
+    mock_orca_launch(monkeypatch, tmp_path, handler)
+    assert sd.dispatch_orca(tmp_path, "task", "worker", None, 120)["accepted"] is True

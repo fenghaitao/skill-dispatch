@@ -103,6 +103,9 @@ secret token; run `verify` afterward to check the token. A send acknowledgement
 proves input acceptance, not a started turn; Orca delivery metadata and warnings
 are retained in the output. Readiness and receipt wait durations must be finite
 and nonnegative. `--ready` applies only to Orca startup and never answers a prompt.
+Each Orca wait subprocess gets a five-second transport margin to return its
+blocked reason. Results arriving after the readiness deadline never permit
+task submission, and readiness errors preserve the last known blocked reason.
 
 ## Skill visibility and validation
 
