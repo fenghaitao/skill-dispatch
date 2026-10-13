@@ -48,19 +48,27 @@ skill-dispatch/
 
 ## Usage
 
-Install the runtime dependency with `python3 -m pip install -r requirements.txt`.
+This project supports Python 3.13 only and uses [uv](https://docs.astral.sh/uv/) to manage the environment and dependencies. The required uv version is declared in `pyproject.toml`.
+
+Create or update the local environment with:
 
 ```bash
-python3 orchestrator/skill_dispatch.py discover --root workspaces
-python3 orchestrator/skill_dispatch.py route --root workspaces --task "Summarize sales.csv"
-python3 orchestrator/skill_dispatch.py dispatch --root <dir> --task "..." --backend local --dispatch-id example-run
-python3 orchestrator/skill_dispatch.py verify --root <dir> --dispatch-id example-run --skill <selected-skill>
+uv sync --group dev
+```
 
-scripts/demo.sh print /tmp/sd-plan        # destination must not exist
-scripts/demo.sh local /tmp/sd-local --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
-scripts/demo.sh orca /tmp/sd-orca --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
-scripts/demo.sh herdr /tmp/sd-herdr --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
-python3 -m pytest -q tests
+Run the dispatcher and tests through uv so they use the managed Python 3.13 environment:
+
+```bash
+uv run python orchestrator/skill_dispatch.py discover --root workspaces
+uv run python orchestrator/skill_dispatch.py route --root workspaces --task "Summarize sales.csv"
+uv run python orchestrator/skill_dispatch.py dispatch --root <dir> --task "..." --backend local --dispatch-id example-run
+uv run python orchestrator/skill_dispatch.py verify --root <dir> --dispatch-id example-run --skill <selected-skill>
+
+uv run bash scripts/demo.sh print /tmp/sd-plan        # destination must not exist
+uv run bash scripts/demo.sh local /tmp/sd-local --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
+uv run bash scripts/demo.sh orca /tmp/sd-orca --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
+uv run bash scripts/demo.sh herdr /tmp/sd-herdr --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
+uv run pytest -q tests
 ```
 
 `demo.sh` copies each workspace into a fresh scratch folder as its own git
