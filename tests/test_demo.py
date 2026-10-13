@@ -21,7 +21,7 @@ def demo_env(tmp_path):
     git = binaries / "git"
     real_git = shutil.which("git")
     assert real_git
-    git.write_text(f'#!/usr/bin/env bash\\nprintf "%s\\\\n" "$*" >> "$GIT_CALLS"\\nexec "{real_git}" "$@"\\n')
+    git.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$GIT_CALLS"\nexec "{real_git}" "$@"\n')
     git.chmod(0o755)
     for name in ("claude", "orca", "orca-ide", "herdr"):
         worker = binaries / name
