@@ -1,5 +1,6 @@
-"""Discovery, routing and receipt checks; no agent is started."""
+"""Discovery, routing and Git identity checks; no agent is started."""
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -9,6 +10,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orchestrator"))
 import skill_dispatch as sd  # noqa: E402
 
 WORKSPACES = Path(__file__).resolve().parents[1] / "workspaces"
+
+
+def _commit(repo: Path):
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                    "commit", "-q", "-m", "initial"], cwd=repo, check=True)
 
 
 def _skill(folder: Path, name: str, description: str, body: str = "") -> Path:
@@ -31,6 +39,7 @@ def test_discovery_never_reads_skill_bodies(tmp_path, monkeypatch, capsys):
     header = path.read_bytes()
     boundary = header.index(b"\n---\n", 4) + len(b"\n---\n")
     path.write_bytes(header[:boundary] + b"SECRET-BODY\xff\xfe")
+    _commit(tmp_path)
     original = Path.open
     positions = []
 
@@ -129,20 +138,22 @@ def test_print_backend_shows_the_plan_without_starting_an_agent(capsys, monkeypa
     assert "`summarize-csv` skill" in plan["prompt"]
 
 
-def test_verify_checks_receipt_token_and_folder(tmp_path):
+def test_git_identity_records_commit_and_skill_path_and_rejects_dirty_skill(tmp_path):
     folder = tmp_path / "a"
-    _skill(folder, "alpha", "does alpha", body='{"skill": "alpha", "token": "tok-1", "cwd": "<pwd>"}')
-    assert sd.verify(tmp_path, "run-1") == [{"skill": "alpha", "state": "no receipt"}]
-    receipt = folder / sd.RECEIPTS / "alpha.json"
-    receipt.parent.mkdir()
-    receipt.write_text(json.dumps({"skill": "alpha", "token": "tok-1", "cwd": str(folder),
-                                   "dispatch_id": "run-1"}))
-    assert sd.verify(tmp_path, "run-1")[0]["state"] == "ok"
-    receipt.write_text(json.dumps({"skill": "alpha", "token": "guess", "cwd": str(folder),
-                                   "dispatch_id": "run-1"}))
-    assert sd.verify(tmp_path, "run-1")[0] == {
-        "skill": "alpha", "state": "mismatch", "token": False,
-        "cwd": True, "identity": True, "dispatch": True}
+    skill_path = _skill(folder, "alpha", "does alpha", body="# Alpha\n")
+    _commit(folder)
+    entry = sd.discover(tmp_path)["folders"][0]["skills"][0]
+    identity = sd.skill_git_identity(folder, entry)
+    assert identity["repo_root"] == str(folder.resolve())
+    assert identity["repo_commit"]
+    assert identity["skill_repo_path"] == ".claude/skills/alpha/SKILL.md"
+
+    (folder / "unrelated.txt").write_text("dirty but unrelated")
+    assert sd.skill_git_identity(folder, entry) == identity
+
+    skill_path.write_text(skill_path.read_text() + "\nchanged instructions\n")
+    with pytest.raises(sd.DispatchError, match="uncommitted changes"):
+        sd.skill_git_identity(folder, entry)
 
 
 @pytest.mark.parametrize("description, expected", [
@@ -210,23 +221,6 @@ def test_unsafe_skill_names_are_refused(tmp_path, name):
     path.write_text(f"---\nname: {json.dumps(name)}\ndescription: things\n---\n")
     with pytest.raises(sd.DispatchError, match="invalid skill name"):
         sd.discover(tmp_path)
-    with pytest.raises(sd.DispatchError, match="invalid skill name"):
-        sd.receipt_path(tmp_path / "a", name)
-
-
-@pytest.mark.parametrize("symlink_directory", [False, True])
-def test_receipt_symlinks_cannot_escape_workspace(tmp_path, symlink_directory):
-    folder = tmp_path / "a"
-    folder.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    if symlink_directory:
-        (folder / sd.RECEIPTS).symlink_to(outside, target_is_directory=True)
-    else:
-        (folder / sd.RECEIPTS).mkdir()
-        (folder / sd.RECEIPTS / "alpha.json").symlink_to(outside / "alpha.json")
-    with pytest.raises(sd.DispatchError, match="escapes"):
-        sd.receipt_path(folder, "alpha")
 
 
 def test_folder_names_do_not_affect_routing_or_ties(tmp_path):

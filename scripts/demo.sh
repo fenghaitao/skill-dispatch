@@ -51,7 +51,6 @@ else:
     print(candidate)
 PY
 )"
-run_id="$("$python" -c 'import uuid; print(uuid.uuid4().hex)')"
 for src in "$here"/workspaces/*/; do
     name="$(basename "$src")"
     dest="$scratch/$name"
@@ -61,7 +60,7 @@ for src in "$here"/workspaces/*/; do
     git -C "$dest" add -A
     git -C "$dest" -c user.name=demo -c user.email=demo@example.invalid commit -q -m "Initial $name"
 done
-echo "sub-repos in $scratch (dispatch ID $run_id)"
+echo "sub-repos in $scratch"
 
 tasks=(
     "Add a multiply(a, b) function to calc.py"
@@ -69,16 +68,8 @@ tasks=(
     "Summarize sales.csv into a report"
 )
 for task in "${tasks[@]}"; do
-    args=(dispatch --root "$scratch" --task "$task" --backend "$backend" --dispatch-id "$run_id")
+    args=(dispatch --root "$scratch" --task "$task" --backend "$backend")
     [ -n "$model" ] && args+=("--model=$model")
-    if [ "$backend" = orca ] || [ "$backend" = herdr ]; then args+=(--wait 600); fi
     args+=("${dispatch_options[@]}")
     "$python" "$here/orchestrator/skill_dispatch.py" "${args[@]}"
 done
-if [ "$backend" = print ]; then
-    echo "print backend: plans only; receipt verification skipped"
-else
-    "$python" "$here/orchestrator/skill_dispatch.py" verify --root "$scratch" \
-        --dispatch-id "$run_id" --skill add-calc-function \
-        --skill write-release-note --skill summarize-csv
-fi

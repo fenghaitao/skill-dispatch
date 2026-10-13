@@ -1,47 +1,42 @@
 # Herdr validation
 
-Validated on 2026-10-13 with Herdr 0.8.2 (protocol 20), Claude Code 2.1.296,
-and Python 3.12.3, from the `herdr-support` worktree.
+The Herdr backend was validated on 2026-10-13 with Herdr 0.8.2 (protocol 20),
+Claude Code 2.1.296, and Python 3.12.3.
 
-## Automated checks
+This note records backend validation, not the current orchestration protocol.
+The original live run predated the simplified design in [design.md](design.md),
+which removed dispatcher receipts, synthetic dispatch IDs, and post-run
+verification.
 
-- `python -m pytest -q tests`: **198 passed**.
-- `bash -n scripts/demo.sh`: passed.
-- `git diff --check`: passed.
+## What the validation established
 
-The tests cover Herdr context requirements, background tab targeting, permission
-arguments, shell startup races, startup timeout limits, blocked startup,
-interactive readiness, worker identity, prompt activity/error responses, and
-Herdr demo dispatch/receipt-wait arguments. They use mocked workers.
+The live and mocked tests exercised:
 
-## Live demo
+- inherited Herdr workspace targeting;
+- background tab creation without stealing focus;
+- Claude agent startup in the selected workspace cwd;
+- permission argument forwarding;
+- shell-startup races;
+- readiness and timeout handling;
+- trust/blocked startup behavior without automatic UI answers;
+- worker identity checks;
+- prompt acknowledgement and observed activity;
+- preservation of the worker tab/session for later inspection.
 
-Run from a terminal in the Herdr worktree:
+The live demo completed all three example tasks successfully:
 
-```bash
-PYTHON=/tmp/skill-dispatch-herdr-venv/bin/python scripts/demo.sh herdr \
-  /tmp/skill-dispatch-herdr-live5 --accept-edits \
-  --allow-tool 'Bash(python3 -m pytest -q)'
-```
+- Calculator: added `multiply(a, b)` and `test_multiply`; an independent
+  pytest run passed.
+- Release notes: added version 0.2.0 above 0.1.0.
+- CSV report: produced the expected row count, totals, regions and months.
 
-The demo exited with status 0. Dispatch ID:
-`61feb8fe0ba34067be1679d069497d4e`.
+## Current lifecycle model
 
-All three dispatches reported `accepted: true`, `activity_observed: true`, and
-`receipt: true`. Final verification returned `state: ok` for all three receipts,
-including skill identity, token, absolute cwd, and current dispatch ID.
+The current dispatcher does not ask the worker to write a receipt. Herdr's
+workspace/tab/pane/agent identifiers and session log are the execution record.
 
-Artifact checks:
+The dispatcher still captures the selected workspace's Git commit and the
+selected skill's blob ID before launch. See [design.md](design.md).
 
-- Calculator: `multiply(a, b)` and `test_multiply` were added; an independent
-  `python -m pytest -q` run passed both calculator tests.
-- Release notes: `0.2.0` appears above `0.1.0`, with “Added a multiply function.”
-- CSV report: 4 rows, amount total 445, regions north/south, months
-  2026-08/2026-09, matching the source CSV.
-
-This was an interactive validation. Folder-trust and a receipt-writing shell
-prompt were resolved with explicit user approval. The dispatcher did not answer
-these prompts. Conservative permissions can still require human input.
-
-The scratch artifacts and full run log were retained locally at
-`/tmp/skill-dispatch-herdr-live5` and `/tmp/skill-dispatch-herdr-live5.log`.
+A blocked startup remains a human decision: resolve it in the Herdr tab. The
+dispatcher observes readiness but does not answer trust prompts.
