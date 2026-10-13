@@ -138,7 +138,7 @@ def test_print_backend_shows_the_plan_without_starting_an_agent(capsys, monkeypa
     assert "`summarize-csv` skill" in plan["prompt"]
 
 
-def test_git_identity_records_commit_and_skill_blob_and_rejects_dirty_skill(tmp_path):
+def test_git_identity_records_commit_and_skill_path_and_rejects_dirty_skill(tmp_path):
     folder = tmp_path / "a"
     skill_path = _skill(folder, "alpha", "does alpha", body="# Alpha\n")
     _commit(folder)
