@@ -35,8 +35,12 @@ import sys
 import time
 from pathlib import Path
 
+import yaml
+
 SKILL_GLOB = ".claude/skills/*/SKILL.md"
 RECEIPTS = ".skill-receipts"
+MAX_FRONTMATTER_BYTES = 16 * 1024
+SKILL_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
 
 class DispatchError(Exception):
@@ -45,19 +49,58 @@ class DispatchError(Exception):
 
 # -- Discovery ---------------------------------------------------------------
 
-def frontmatter(path: Path) -> dict[str, str]:
-    """The `key: value` pairs between the leading `---` lines; the body is not read."""
-    fields: dict[str, str] = {}
-    with path.open(encoding="utf-8") as handle:
-        if handle.readline().strip() != "---":
-            return fields
-        for line in handle:
-            if line.strip() == "---":
-                return fields
-            key, sep, value = line.partition(":")
-            if sep and key.strip() and not key.startswith((" ", "\t")):
-                fields[key.strip()] = value.strip().strip("'\"")
-    raise DispatchError(f"{path}: frontmatter is not closed")
+class UniqueKeyLoader(yaml.SafeLoader):
+    """Safe YAML with duplicate mapping keys refused instead of overwritten."""
+
+    def construct_mapping(self, node, deep=False):
+        self.flatten_mapping(node)
+        keys = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in keys:
+                raise yaml.constructor.ConstructorError(
+                    None, None, f"duplicate key {key!r}", key_node.start_mark)
+            keys.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
+def validate_skill_name(name: str) -> str:
+    if not isinstance(name, str) or len(name) > 64 or not SKILL_NAME.fullmatch(name):
+        raise DispatchError(f"invalid skill name: {name!r}; use lowercase words separated by hyphens")
+    return name
+
+
+def frontmatter(path: Path) -> dict:
+    """Parse at most 16 KiB of YAML, with no read-ahead past the closing line."""
+    # FileIO is unbuffered: its readline reads only through the newline. TextIO
+    # would decode a whole buffered chunk, including bytes from the skill body.
+    with path.open("rb", buffering=0) as handle:
+        if handle.read(3) != b"---":
+            return {}
+        ending = handle.read(1)
+        if ending == b"\r":
+            ending += handle.read(1)
+        if ending not in (b"\n", b"\r\n"):
+            return {}
+        used = 3 + len(ending)
+        header = bytearray()
+        while used < MAX_FRONTMATTER_BYTES:
+            line = handle.readline(MAX_FRONTMATTER_BYTES - used)
+            if not line:
+                raise DispatchError(f"{path}: frontmatter is not closed")
+            used += len(line)
+            if line.rstrip(b"\r\n") == b"---":
+                break
+            header.extend(line)
+        else:
+            raise DispatchError(f"{path}: frontmatter exceeds {MAX_FRONTMATTER_BYTES} bytes")
+    try:
+        fields = yaml.load(header.decode("utf-8"), Loader=UniqueKeyLoader)
+    except (yaml.YAMLError, UnicodeError, TypeError) as exc:
+        raise DispatchError(f"{path}: invalid YAML frontmatter: {exc}") from exc
+    if not isinstance(fields, dict):
+        raise DispatchError(f"{path}: frontmatter must be a mapping")
+    return fields
 
 
 def discover(root: Path) -> dict:
@@ -68,8 +111,10 @@ def discover(root: Path) -> dict:
         skills = []
         for path in sorted(folder.glob(SKILL_GLOB)):
             meta = frontmatter(path)
-            if not meta.get("name") or not meta.get("description"):
+            if any(not isinstance(meta.get(key), str) or not meta[key].strip()
+                   for key in ("name", "description")):
                 raise DispatchError(f"{path}: frontmatter needs name and description")
+            validate_skill_name(meta["name"])
             skills.append({"name": meta["name"], "description": meta["description"],
                            "file": path.relative_to(folder).as_posix()})
         if skills:
@@ -101,7 +146,7 @@ def route(catalog: dict, task: str, skill: str | None = None) -> dict:
                 return {"folder": folder, "skill": entry, "score": None}
         raise DispatchError(f"no folder has a skill named {skill!r}")
     task_words = _words(task)
-    scored = sorted(((len(task_words & _words(f"{s['name']} {s['description']} {f['folder']}")), f, s)
+    scored = sorted(((len(task_words & _words(f"{s['name']} {s['description']}")), f, s)
                      for f, s in entries), key=lambda item: -item[0])
     if not scored or scored[0][0] == 0:
         raise DispatchError("no skill matches the task; name one with --skill")
@@ -194,7 +239,7 @@ def dispatch_local(folder: Path, prompt: str, model: str | None) -> dict:
 
 
 def wait_for_receipt(folder: Path, skill: str, seconds: float) -> bool:
-    receipt = folder / RECEIPTS / f"{skill}.json"
+    receipt = receipt_path(folder, skill)
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if receipt.is_file():
@@ -208,12 +253,22 @@ def wait_for_receipt(folder: Path, skill: str, seconds: float) -> bool:
 TOKEN = re.compile(r'"token":\s*"([^"]+)"')
 
 
+def receipt_path(folder: Path, skill: str) -> Path:
+    """Keep receipt lookup within the chosen workspace's receipt directory."""
+    validate_skill_name(skill)
+    directory = folder.resolve() / RECEIPTS
+    receipt = directory / f"{skill}.json"
+    if not receipt.resolve().is_relative_to(directory):
+        raise DispatchError(f"receipt path escapes {directory}: {receipt}")
+    return receipt
+
+
 def verify(root: Path) -> list[dict]:
     results = []
     for folder in discover(root)["folders"]:
         base = Path(folder["path"])
         for skill in folder["skills"]:
-            receipt = base / RECEIPTS / f"{skill['name']}.json"
+            receipt = receipt_path(base, skill["name"])
             if not receipt.is_file():
                 results.append({"skill": skill["name"], "state": "no receipt"})
                 continue

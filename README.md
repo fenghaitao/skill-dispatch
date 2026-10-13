@@ -36,6 +36,8 @@ skill-dispatch/
 
 ## Usage
 
+Install the runtime dependency with `python3 -m pip install -r requirements.txt`.
+
 ```bash
 python3 orchestrator/skill_dispatch.py discover --root workspaces
 python3 orchestrator/skill_dispatch.py route --root workspaces --task "Summarize sales.csv"

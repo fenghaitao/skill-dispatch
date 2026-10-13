@@ -26,14 +26,47 @@ def test_discovery_reads_frontmatter_of_every_workspace():
                       "release-notes": ["write-release-note"]}
 
 
-def test_discovery_never_reads_skill_bodies(tmp_path, monkeypatch):
-    _skill(tmp_path / "a", "alpha", "does alpha things", body="SECRET-BODY")
-    reads = []
-    original = Path.read_text
-    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: reads.append(self) or original(self, *a, **k))
+def test_discovery_never_reads_skill_bodies(tmp_path, monkeypatch, capsys):
+    path = _skill(tmp_path / "a", "alpha", "does alpha things")
+    header = path.read_bytes()
+    boundary = header.index(b"\n---\n", 4) + len(b"\n---\n")
+    path.write_bytes(header[:boundary] + b"SECRET-BODY\xff\xfe")
+    original = Path.open
+    positions = []
+
+    class HeaderOnly:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.handle.close()
+
+        def read(self, size):
+            data = self.handle.read(size)
+            positions.append(self.handle.tell())
+            assert positions[-1] <= boundary
+            return data
+
+        def readline(self, size):
+            data = self.handle.readline(size)
+            positions.append(self.handle.tell())
+            assert positions[-1] <= boundary
+            return data
+
+    def open_header(self, *args, **kwargs):
+        assert args == ("rb",) and kwargs == {"buffering": 0}
+        return HeaderOnly(original(self, *args, **kwargs))
+
+    monkeypatch.setattr(Path, "open", open_header)
     catalog = sd.discover(tmp_path)
     assert "SECRET-BODY" not in json.dumps(catalog)
-    assert reads == []
+    assert positions[-1] == boundary
+    for command in ("route", "dispatch"):
+        assert sd.main([command, "--root", str(tmp_path), "--task", "alpha"]) == 0
+    capsys.readouterr()
 
 
 def test_folders_without_skills_are_skipped(tmp_path):
@@ -60,15 +93,15 @@ def test_unclosed_or_incomplete_frontmatter_is_refused(tmp_path):
         sd.discover(tmp_path)
 
 
-@pytest.mark.parametrize("task, skill", [
-    ("Add a multiply function to calc.py", "add-calc-function"),
-    ("Write a release note for version 0.2.0", "write-release-note"),
-    ("Summarize sales.csv into a report", "summarize-csv"),
+@pytest.mark.parametrize("task, skill, folder", [
+    ("Add a multiply function to calc.py", "add-calc-function", "calc-lib"),
+    ("Write a release note for version 0.2.0", "write-release-note", "release-notes"),
+    ("Summarize sales.csv into a report", "summarize-csv", "data-tools"),
 ])
-def test_tasks_route_to_the_folder_whose_skill_fits(task, skill):
+def test_tasks_route_to_the_folder_whose_skill_fits(task, skill, folder):
     choice = sd.route(sd.discover(WORKSPACES), task)
     assert choice["skill"]["name"] == skill
-    assert Path(choice["folder"]["path"]).name in str(choice["folder"]["path"])
+    assert Path(choice["folder"]["path"]) == (WORKSPACES / folder).resolve()
 
 
 def test_a_named_skill_wins_and_unknown_names_fail():
@@ -105,3 +138,98 @@ def test_verify_checks_receipt_token_and_folder(tmp_path):
     assert sd.verify(tmp_path)[0]["state"] == "ok"
     receipt.write_text(json.dumps({"skill": "alpha", "token": "guess", "cwd": str(folder)}))
     assert sd.verify(tmp_path)[0] == {"skill": "alpha", "state": "mismatch", "token": False, "cwd": True}
+
+
+@pytest.mark.parametrize("description, expected", [
+    (">-\n  summarize widgets\n  into reports", "summarize widgets into reports"),
+    ("|\n  summarize widgets\n  into reports", "summarize widgets\ninto reports\n"),
+    ('"summarize \\"widgets\\"" # comment', 'summarize "widgets"'),
+    ("'summarize user''s widgets'", "summarize user's widgets"),
+])
+def test_yaml_frontmatter_routes_block_and_quoted_descriptions(tmp_path, description, expected):
+    _skill(tmp_path / "a", "alpha", description)
+    catalog = sd.discover(tmp_path)
+    assert catalog["folders"][0]["skills"][0]["description"] == expected
+    assert sd.route(catalog, "summarize widgets")["skill"]["name"] == "alpha"
+
+
+@pytest.mark.parametrize("header, message", [
+    ("name: alpha\nname: beta\ndescription: things", "duplicate key"),
+    ("name: alpha\ndescription: [unclosed", "invalid YAML"),
+    ("- name\n- description", "mapping"),
+    ("name: alpha\ndescription: []", "name and description"),
+    ("name: alpha\ndescription: ' '", "name and description"),
+    ("name: true\ndescription: things", "name and description"),
+    ("name: alpha\ndescription: !!python/object:os.system {}", "invalid YAML"),
+])
+def test_invalid_yaml_frontmatter_is_refused(tmp_path, header, message):
+    path = _skill(tmp_path / "a", "alpha", "things")
+    path.write_text(f"---\n{header}\n---\n")
+    with pytest.raises(sd.DispatchError, match=message):
+        sd.discover(tmp_path)
+
+
+def test_frontmatter_supports_crlf(tmp_path):
+    path = tmp_path / "SKILL.md"
+    path.write_bytes(b"---\r\nname: alpha\r\ndescription: things\r\n---\r\n\xff")
+    assert sd.frontmatter(path) == {"name": "alpha", "description": "things"}
+
+
+def test_unterminated_header_read_is_bounded(tmp_path, monkeypatch):
+    path = tmp_path / "SKILL.md"
+    path.write_bytes(b"---\n" + b"x" * (sd.MAX_FRONTMATTER_BYTES * 2))
+    # Count raw reads independently of the parser's error text.
+    import io
+    read_positions = []
+
+    class TrackingFile(io.FileIO):
+        def read(self, size=-1):
+            data = super().read(size)
+            read_positions.append(self.tell())
+            return data
+
+        def readline(self, size=-1):
+            data = super().readline(size)
+            read_positions.append(self.tell())
+            return data
+
+    monkeypatch.setattr(Path, "open", lambda self, *a, **k: TrackingFile(self, "r"))
+    with pytest.raises(sd.DispatchError, match="exceeds"):
+        sd.frontmatter(path)
+    assert max(read_positions) == sd.MAX_FRONTMATTER_BYTES
+
+
+@pytest.mark.parametrize("name", ["../other", "/tmp/other", "a/b", "alpha\\beta", "Alpha", "a" * 65])
+def test_unsafe_skill_names_are_refused(tmp_path, name):
+    path = _skill(tmp_path / "a", "alpha", "things")
+    path.write_text(f"---\nname: {json.dumps(name)}\ndescription: things\n---\n")
+    with pytest.raises(sd.DispatchError, match="invalid skill name"):
+        sd.discover(tmp_path)
+    with pytest.raises(sd.DispatchError, match="invalid skill name"):
+        sd.receipt_path(tmp_path / "a", name)
+
+
+@pytest.mark.parametrize("symlink_directory", [False, True])
+def test_receipt_symlinks_cannot_escape_workspace(tmp_path, symlink_directory):
+    folder = tmp_path / "a"
+    folder.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if symlink_directory:
+        (folder / sd.RECEIPTS).symlink_to(outside, target_is_directory=True)
+    else:
+        (folder / sd.RECEIPTS).mkdir()
+        (folder / sd.RECEIPTS / "alpha.json").symlink_to(outside / "alpha.json")
+    with pytest.raises(sd.DispatchError, match="escapes"):
+        sd.receipt_path(folder, "alpha")
+
+
+def test_folder_names_do_not_affect_routing_or_ties(tmp_path):
+    _skill(tmp_path / "reports", "alpha", "parse widgets")
+    _skill(tmp_path / "widgets", "beta", "parse gadgets")
+    catalog = sd.discover(tmp_path)
+    with pytest.raises(sd.DispatchError, match="no skill matches"):
+        sd.route(catalog, "reports")
+    assert sd.route(catalog, "widgets")["skill"]["name"] == "alpha"
+    with pytest.raises(sd.DispatchError, match="equally"):
+        sd.route(catalog, "parse")
