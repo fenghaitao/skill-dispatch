@@ -2,7 +2,8 @@
 
 A small prototype of an orchestrator that discovers the skills of several
 folders and dispatches work to an agent in the right folder. The worker finds
-the skill in its own folder; the orchestrator never loads it.
+the skill in its own folder. Discovery, routing and dispatch read only frontmatter;
+verification intentionally reads skill bodies to check receipt tokens.
 
 ```
 skill-dispatch/
@@ -19,7 +20,10 @@ skill-dispatch/
 
 1. **Discover.** Scan each folder for `.claude/skills/*/SKILL.md` and read only
    the frontmatter (`name`, `description`) into a catalog. The skill body is
-   never read here.
+   never read here. YAML frontmatter is limited to 16 KiB, parsed safely, and
+   duplicate keys are rejected. Names must be lowercase letters or digits in
+   words separated by hyphens, at most 64 characters. Receipt paths must stay
+   inside the workspace's `.skill-receipts/` directory, including through symlinks.
 2. **Route.** Pick the skill for a task: the one named with `--skill`, or the
    best word overlap between the task and the skills' names and descriptions.
    No match, or a tie, asks for `--skill`.
@@ -49,13 +53,21 @@ python3 orchestrator/skill_dispatch.py route --root workspaces --task "Summarize
 python3 orchestrator/skill_dispatch.py dispatch --root <dir> --task "..." --backend local --dispatch-id example-run
 python3 orchestrator/skill_dispatch.py verify --root <dir> --dispatch-id example-run --skill <selected-skill>
 
-scripts/demo.sh local /tmp/sd-demo        # MODEL=claude-haiku-5-5 for cheap workers
-scripts/demo.sh orca  /tmp/sd-demo
+scripts/demo.sh print /tmp/sd-plan        # destination must not exist
+scripts/demo.sh local /tmp/sd-local --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
+scripts/demo.sh orca /tmp/sd-orca --accept-edits --allow-tool 'Bash(python3 -m pytest -q)'
 python3 -m pytest -q tests
 ```
 
-`demo.sh` copies each workspace into a scratch folder as its own git
-repository (a sub-repo), so runs never change this repository.
+`demo.sh` copies each workspace into a fresh scratch folder as its own git
+repository (a sub-repo). It rejects destinations that exist or overlap this
+repository, including aliases through symlinks. It never deletes an existing
+destination. Omit the scratch argument to create a new temporary folder.
+It validates the backend and permission options before creating the scratch
+folder. Print mode produces plans and explicitly skips receipt verification;
+worker modes verify the three expected receipts with one fresh run ID.
+Scratch copying leaves the original repository alone; worker access to other
+folders still depends on permissions and external isolation.
 
 ## Permissions
 
@@ -87,14 +99,20 @@ proves input acceptance, not a started turn; Orca delivery metadata and warnings
 are retained in the output. Readiness and receipt wait durations must be finite
 and nonnegative. `--ready` applies only to Orca startup and never answers a prompt.
 
-## Findings
+## Skill visibility and validation
 
-- A Claude Code session started in the folder that holds the sub-repos sees
-  none of their skills; a session started inside `calc-lib` sees
-  `add-calc-function`. Skills follow the working directory.
-- With both the `local` and the `orca` backend, all three workers wrote
-  receipts with the right token and folder, and did the work in their own
-  sub-repo (calc.py and its test, the 0.2.0 changelog entry, the sales report).
-- A folder Claude Code has not been told to trust opens with a trust prompt.
-  The `orca` backend leaves that to a person: it names the waiting tab and
-  sends the task once the agent is ready. `claude -p` does not prompt.
+A parent-folder session does not initially load the child workspaces' skills.
+Starting inside `calc-lib` makes `add-calc-function` available locally. Claude
+can subsequently discover nested skills when it works on files in those folders;
+see [Claude's skill discovery documentation](https://code.claude.com/docs/en/skills).
+The working directory determines initial discovery, not lifetime isolation.
+
+An untrusted folder can require a human trust decision in an interactive session.
+Orca dispatch reports a blocked tab and waits within `--ready`; it sends only
+after a positive readiness result and never answers the trust prompt. Local
+dispatch uses noninteractive `claude -p` with stdin disabled.
+
+The test suite mocks worker subprocesses and Orca responses, including permissions,
+folder selection, trust waits, timeouts, send acknowledgements and receipt checks.
+It also runs the demo with the print backend only. These tests do not establish
+that a live Claude/Orca installation starts workers or completes the example tasks.
