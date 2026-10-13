@@ -9,7 +9,7 @@ skill locally. Execution lifecycle and history belong to the backend session.
     skill_dispatch.py discover --root <dir>
     skill_dispatch.py route    --root <dir> --task "..." [--skill NAME]
     skill_dispatch.py dispatch --root <dir> --task "..." [--skill NAME]
-                               [--backend print|local|orca|herdr] [--agent claude|copilot]
+                               [--backend print|local|orca|herdr] [--agent claude|copilot|codex]
                                [--model M]
 
 Backends:
@@ -21,8 +21,9 @@ Backends:
   herdr  open a background tab in the caller's Herdr workspace and start the worker
          through the agent API; wait for readiness before submitting the task.
 
-Agents: `claude` (Claude Code, the default) or `copilot` (GitHub Copilot CLI, which
-also loads `.claude/skills`). Copilot works with the local and herdr backends.
+Agents: `claude` (Claude Code, the default), `copilot` (GitHub Copilot CLI, which
+also loads `.claude/skills`) or `codex` (OpenAI Codex CLI, which is told the skill
+file's path). Copilot and Codex work with the local and herdr backends.
 
 Existing skills are never modified and no receipt protocol is injected into
 their tasks. Git identifies the code/skill snapshot; the local process or the
@@ -49,7 +50,7 @@ MAX_FRONTMATTER_BYTES = 16 * 1024
 SKILL_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 ORCA_WAIT_MARGIN_SECONDS = 5
 HERDR_LATE_ACTIVITY_SECONDS = 60
-AGENTS = ("claude", "copilot")
+AGENTS = ("claude", "copilot", "codex")
 # --accept-edits for Copilot: file writes plus common move/mkdir commands, like acceptEdits.
 COPILOT_EDIT_RULES = ("write", "shell(mkdir)", "shell(mv)")
 CLAUDE_TOOL_RULE = re.compile(r"(Bash|Edit|MultiEdit|Write|Read|NotebookEdit|Glob|Grep|"
@@ -173,9 +174,12 @@ def route(catalog: dict, task: str, skill: str | None = None) -> dict:
     return {"folder": folder, "skill": entry, "score": score}
 
 
-def prompt_for(task: str, skill: str) -> str:
-    return (f"Use the `{skill}` skill from this folder for the following task. "
-            f"Follow the skill's steps exactly.\n\nTask: {task}")
+def prompt_for(task: str, skill: str, skill_file: str | None = None) -> str:
+    """`skill_file` names the SKILL.md for agents that do not discover `.claude/skills`."""
+    where = (f" Its instructions are in `{skill_file}`; read that file and follow"
+             if skill_file else " Follow")
+    return (f"Use the `{skill}` skill from this folder for the following task.{where} "
+            f"the skill's steps exactly.\n\nTask: {task}")
 
 
 # -- Dispatch ----------------------------------------------------------------
@@ -283,14 +287,31 @@ def copilot_permission_args(accept_edits: bool = False, allow_tools: list[str] |
     return [f"--allow-tool={rule}" for rule in rules]
 
 
+def codex_args(accept_edits: bool = False, allow_tools: list[str] | None = None,
+               interactive: bool = True) -> list[str]:
+    """Codex permissions are a sandbox mode; always pass it so config cannot widen it."""
+    if allow_tools:
+        raise DispatchError("Codex has no per-tool approval rules; use --accept-edits "
+                            "for its workspace-write sandbox")
+    argv = ["--sandbox", "workspace-write" if accept_edits else "read-only"]
+    if not interactive:
+        return argv  # `codex exec` never asks for approval
+    # Without --no-daemon, a conflicting shared server shows a modal that Herdr
+    # reported as idle and ready. The update dialog defaults to running an installer.
+    return ["--no-daemon", "--config=check_for_update_on_startup=false", *argv,
+            "--ask-for-approval", "never"]
+
+
 def agent_args(agent: str, model: str | None = None, *, accept_edits: bool = False,
-               allow_tools: list[str] | None = None) -> list[str]:
+               allow_tools: list[str] | None = None, interactive: bool = True) -> list[str]:
     """Options following the worker executable: permissions, then the model."""
     if agent == "claude":
         argv = permission_args(accept_edits, allow_tools)
     elif agent == "copilot":
         # A worker cannot ask questions back through the dispatcher.
         argv = ["--no-ask-user", *copilot_permission_args(accept_edits, allow_tools)]
+    elif agent == "codex":
+        argv = codex_args(accept_edits, allow_tools, interactive)
     else:
         raise DispatchError(f"unsupported agent {agent!r}; choose from {', '.join(AGENTS)}")
     if model:
@@ -372,9 +393,13 @@ def dispatch_orca(folder: Path, prompt: str, title: str, model: str | None,
 def dispatch_local(folder: Path, prompt: str, model: str | None, *,
                    accept_edits: bool = False, allow_tools: list[str] | None = None,
                    agent: str = "claude") -> dict:
-    options = agent_args(agent, model, accept_edits=accept_edits, allow_tools=allow_tools)
-    # Copilot's -s prints only the agent's response, without usage statistics.
-    argv = [agent, "-p", prompt, *(["-s"] if agent == "copilot" else []), *options]
+    options = agent_args(agent, model, accept_edits=accept_edits, allow_tools=allow_tools,
+                         interactive=False)
+    if agent == "codex":
+        argv = ["codex", "exec", *options, "--", prompt]
+    else:
+        # Copilot's -s prints only the agent's response, without usage statistics.
+        argv = [agent, "-p", prompt, *(["-s"] if agent == "copilot" else []), *options]
     result = _run(argv, cwd=folder.resolve(), timeout=900, stdin=subprocess.DEVNULL)
     return {"backend": "local", "agent": agent, "exit": result.returncode,
             "output": (result.stdout or result.stderr).strip()[-2000:]}
@@ -554,7 +579,8 @@ def main(argv: list[str] | None = None) -> int:
         if name == "dispatch":
             p.add_argument("--backend", choices=("print", "local", "orca", "herdr"), default="print")
             p.add_argument("--agent", choices=AGENTS, default="claude",
-                           help="worker CLI: Claude Code or GitHub Copilot CLI (local/herdr)")
+                           help="worker CLI: Claude Code, GitHub Copilot CLI or OpenAI Codex "
+                                "CLI (Copilot and Codex: local/herdr)")
             p.add_argument("--model")
             p.add_argument("--accept-edits", action="store_true",
                            help="opt in to automatic approval of in-scope edits")
@@ -578,8 +604,9 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(plan, indent=2))
             return 0
         git_identity = skill_git_identity(folder, choice["skill"])
+        skill_file = choice["skill"]["file"] if args.agent == "codex" else None
         plan = {"folder": str(folder), "skill": skill, "score": choice["score"],
-                "prompt": prompt_for(args.task, skill), **git_identity}
+                "prompt": prompt_for(args.task, skill, skill_file), **git_identity}
         if args.backend == "print":
             print(json.dumps(plan, indent=2))
             return 0

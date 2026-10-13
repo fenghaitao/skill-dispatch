@@ -44,9 +44,11 @@ skill-dispatch/
    - `herdr`: create a background tab, start a named agent, wait for
      readiness, then submit the task.
 
-   `--agent` picks the worker CLI: `claude` (Claude Code, the default) or
-   `copilot` (GitHub Copilot CLI) for the `local` and `herdr` backends; see
-   [GitHub Copilot workers](#github-copilot-workers).
+   `--agent` picks the worker CLI: `claude` (Claude Code, the default),
+   `copilot` (GitHub Copilot CLI) or `codex` (OpenAI Codex CLI). Copilot and
+   Codex work with the `local` and `herdr` backends; see
+   [GitHub Copilot workers](#github-copilot-workers) and
+   [OpenAI Codex workers](#openai-codex-workers).
 
 There is no dispatcher receipt, synthetic run ID, or verify command. Execution
 state and history belong to the backend session/process. Git identity answers
@@ -78,6 +80,8 @@ AGENT=copilot scripts/demo.sh local /tmp/sd-copilot --accept-edits \
   --allow-tool 'shell(python3)'
 AGENT=copilot scripts/demo.sh herdr /tmp/sd-copilot-herdr --accept-edits \
   --allow-tool 'shell(python3)'
+AGENT=codex scripts/demo.sh local /tmp/sd-codex --accept-edits
+AGENT=codex scripts/demo.sh herdr /tmp/sd-codex-herdr --accept-edits
 
 uv run pytest -q tests
 ```
@@ -130,8 +134,9 @@ owns.
 
 All worker backends start Claude with `--permission-mode dontAsk` by default.
 Operations that need approval are denied unless existing rules allow them.
-Copilot workers get the equivalent rules described under
-[GitHub Copilot workers](#github-copilot-workers).
+Copilot and Codex workers get the equivalent settings described under
+[GitHub Copilot workers](#github-copilot-workers) and
+[OpenAI Codex workers](#openai-codex-workers).
 
 Use `--accept-edits` to opt into `acceptEdits`. Use repeatable
 `--allow-tool RULE` options for specific tool rules, for example:
@@ -154,7 +159,7 @@ after prompt submission, which confirms that the backend accepted and started
 processing the turn; it is not a claim that the requested task is correct.
 
 Run the Herdr backend from a Herdr-managed terminal with `HERDR_ENV=1` and
-`HERDR_WORKSPACE_ID` available, plus the worker CLI (`claude` or `copilot`):
+`HERDR_WORKSPACE_ID` available, plus the worker CLI (`claude`, `copilot` or `codex`):
 
 ```bash
 python3 orchestrator/skill_dispatch.py dispatch --root workspaces \
@@ -172,8 +177,8 @@ Before submitting, dispatch reads the pane's foreground processes with
 `herdr pane process-info` and requires the worker to run with exactly the
 requested options. Otherwise it reports what it found and leaves the tab open
 without sending the task. Remove or rename such an alias to use the backend.
-The check was validated with Herdr 0.9.3 (protocol 22) for Claude and Copilot
-workers.
+The check was validated with Herdr 0.9.3 (protocol 22) for Claude, Copilot and
+Codex workers.
 
 Herdr's prompt gate requires the worker to start within five seconds of
 accepting input. A worker can be slower, for example Copilot reloading MCP
@@ -218,6 +223,50 @@ environment variable and the `defaultPermissionMode` and `defaultMode` settings
 in `~/.copilot/settings.json` can still widen approvals, and the Herdr launch
 check cannot see them. Leave them unset for conservative workers.
 
+## OpenAI Codex workers
+
+`--agent codex` starts [OpenAI Codex CLI](https://github.com/openai/codex).
+Codex does not discover `.claude/skills/`, so the prompt for a Codex worker
+also names the selected skill file, for example
+`.claude/skills/summarize-csv/SKILL.md`. Discovery already knows that path, so
+the dispatcher still reads only frontmatter and the workspaces need no changes.
+The printed plan shows the exact prompt. Codex must be installed and signed in
+(`codex login`), and the workspace must be a Git repository.
+
+- `local` runs `codex exec --sandbox MODE -- PROMPT`; `codex exec` never asks
+  for approval.
+- `herdr` starts the worker with `herdr agent start --kind codex` and adds
+  `--ask-for-approval never`, so Codex returns failures to the model instead of
+  prompting. It also adds `--no-daemon` and
+  `--config=check_for_update_on_startup=false`: with a conflicting shared Codex
+  server, Codex showed a settings modal that Herdr reported as idle and ready,
+  and the update dialog's default option runs an installer.
+- `orca` rejects `--agent codex` for now.
+
+Codex permissions are a sandbox mode rather than per-tool rules. The sandbox is
+always passed explicitly, so `~/.codex/config.toml` or a profile cannot pick it:
+
+| Option | Claude Code | Codex CLI |
+| --- | --- | --- |
+| default | `--permission-mode dontAsk` | `--sandbox read-only` |
+| `--accept-edits` | `--permission-mode acceptEdits` | `--sandbox workspace-write` |
+| `--allow-tool RULE` | `--allowedTools=RULE,...` | rejected before anything starts |
+
+`workspace-write` lets Codex run any command without asking, inside an OS
+sandbox that allows writes to the workspace. That
+is broader than Claude's `acceptEdits` in what may run, but writes are
+confined: in a live check, writing to the home directory failed with
+"Read-only file system". Use `--model` to pick a Codex model.
+
+The dispatcher controls only Codex's command line. Execpolicy `.rules` files
+(for example in `~/.codex/rules`) and other Codex configuration can still
+change what runs, and the Herdr launch check cannot see them. Codex readiness
+relies on Herdr's detection, which misreported one modal as ready before
+`--no-daemon` was added.
+
+Codex asks whether to trust each new folder and saves the answer in
+`~/.codex/config.toml`. The dispatcher never answers that prompt.
+
 ## Skill visibility
 
 A parent-folder Claude session does not initially load child workspace skills.
@@ -232,7 +281,7 @@ isolation boundary.
 ## Tests
 
 The test suite covers frontmatter safety, routing, Git identity, permission
-arguments for Claude and Copilot, Orca/Herdr readiness and trust behavior,
+arguments for Claude, Copilot and Codex, Orca/Herdr readiness and trust behavior,
 the Herdr launch check, backend acknowledgements, and the demo's
 scratch-repository safety. Backend tests use mocks; they do not prove that a
-live Claude/Copilot/Orca/Herdr installation will complete a task correctly.
+live Claude/Copilot/Codex/Orca/Herdr installation will complete a task correctly.

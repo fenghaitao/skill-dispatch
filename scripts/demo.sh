@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copy workspaces into fresh scratch repositories and dispatch one task to each.
-# Usage: [AGENT=claude|copilot] [MODEL=M] scripts/demo.sh [local|orca|herdr|print]
+# Usage: [AGENT=claude|copilot|codex] [MODEL=M] scripts/demo.sh [local|orca|herdr|print]
 #                       [new-scratch-dir] [--accept-edits] [--allow-tool RULE ...]
 set -euo pipefail
 backend="${1:-print}"
@@ -10,7 +10,7 @@ case "$backend" in
 esac
 agent="${AGENT:-claude}"
 case "$agent" in
-    claude|copilot) ;;
+    claude|copilot|codex) ;;
     *) echo "invalid AGENT: $agent" >&2; exit 2 ;;
 esac
 if [ "$#" -gt 0 ]; then shift; fi

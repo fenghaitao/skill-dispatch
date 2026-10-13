@@ -124,9 +124,11 @@ tests, builds, generated artifacts, human review, or other acceptance checks.
 
 ## Backends
 
-Each backend starts a worker CLI chosen with `--agent`: Claude Code (default)
-or GitHub Copilot CLI, which also reads `.claude/skills`. Copilot is supported
-by the local and Herdr backends.
+Each backend starts a worker CLI chosen with `--agent`: Claude Code (default),
+GitHub Copilot CLI, which also reads `.claude/skills`, or OpenAI Codex CLI, which
+does not. A Codex worker's prompt therefore names the selected skill file, a
+path known from discovery. Copilot and Codex are supported by the local and
+Herdr backends.
 
 ### print
 
@@ -134,7 +136,7 @@ Return the routing plan and Git identity without starting an agent.
 
 ### local
 
-Run `claude -p` (or `copilot -p`) with the workspace as cwd. Process exit and captured output are
+Run `claude -p` (or `copilot -p`, or `codex exec`) with the workspace as cwd. Process exit and captured output are
 the lifecycle result.
 
 ### Orca
@@ -146,8 +148,8 @@ The returned terminal handle is the execution identity.
 
 ### Herdr
 
-Create a background tab in the inherited Herdr workspace, start a named Claude
-or Copilot agent, wait for interactive readiness, check that the worker runs
+Create a background tab in the inherited Herdr workspace, start a named Claude,
+Copilot or Codex agent, wait for interactive readiness, check that the worker runs
 with exactly the requested options (a shell alias must not widen them), then
 submit the task.
 
@@ -158,8 +160,8 @@ be used to inspect the session later.
 
 Routing to a workspace does not grant permissions.
 
-Workers start conservatively with `--permission-mode dontAsk`, or for Copilot
-with no `--allow-tool` approvals. Wider edit or
+Workers start conservatively with `--permission-mode dontAsk`, for Copilot
+with no `--allow-tool` approvals, and for Codex in the `read-only` sandbox. Wider edit or
 tool permissions require explicit CLI opt-ins. A cwd is not a security
 boundary; use OS/container isolation where needed.
 

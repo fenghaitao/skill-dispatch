@@ -76,7 +76,7 @@ def test_orca_rejects_copilot_before_contacting_orca(monkeypatch, tmp_path):
 def test_main_rejects_unknown_agent(capsys):
     with pytest.raises(SystemExit):
         sd.main(["dispatch", "--root", str(WORKSPACES), "--task", "Summarize sales.csv",
-                 "--backend", "local", "--agent", "codex"])
+                 "--backend", "local", "--agent", "gemini"])
     capsys.readouterr()
 
 
@@ -285,7 +285,7 @@ def test_orca_zero_readiness_budget_starts_nothing(monkeypatch, tmp_path):
         sd.dispatch_orca(tmp_path, "task", "worker", None, 0)
 
 
-@pytest.mark.parametrize("agent", ["claude", "copilot"])
+@pytest.mark.parametrize("agent", ["claude", "copilot", "codex"])
 @pytest.mark.parametrize("backend", ["local", "orca", "herdr"])
 def test_main_forwards_explicit_permission_opt_ins(monkeypatch, capsys, backend, agent):
     def dispatch(folder, prompt, *args, **kwargs):
@@ -350,3 +350,62 @@ def test_orca_subprocess_margin_is_based_on_wait_chunk(tmp_path, monkeypatch):
 
     mock_orca_launch(monkeypatch, tmp_path, handler)
     assert sd.dispatch_orca(tmp_path, "task", "worker", None, 120)["accepted"] is True
+
+
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_local_codex_uses_exec_with_explicit_sandbox(tmp_path, monkeypatch, opt_in):
+    calls = []
+    prompt = "--not-an-option $(touch unwanted)"
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "done", "")
+
+    monkeypatch.setattr(sd.subprocess, "run", run)
+    result = sd.dispatch_local(tmp_path, prompt, "gpt-x", accept_edits=opt_in, agent="codex")
+    argv, kwargs = calls[0]
+    # exec never asks for approval and rejects -a; the prompt follows -- verbatim.
+    assert argv == ["codex", "exec", "--sandbox", "workspace-write" if opt_in else "read-only",
+                    "--model=gpt-x", "--", prompt]
+    assert kwargs["cwd"] == tmp_path.resolve() and kwargs["stdin"] == subprocess.DEVNULL
+    assert result["agent"] == "codex" and result["exit"] == 0
+
+
+def test_codex_rejects_tool_rules_before_starting(monkeypatch):
+    monkeypatch.setattr(sd.subprocess, "run", lambda *a, **kw: pytest.fail("started a worker"))
+    with pytest.raises(sd.DispatchError, match="no per-tool approval rules"):
+        sd.dispatch_local(Path("."), "task", None, allow_tools=["shell(python3)"], agent="codex")
+
+
+def test_orca_rejects_codex_before_contacting_orca(monkeypatch, tmp_path):
+    monkeypatch.setattr(sd, "_orca", lambda *a, **kw: pytest.fail("contacted Orca"))
+    with pytest.raises(sd.DispatchError, match="only --agent claude"):
+        sd.dispatch_orca(tmp_path, "task", "worker", None, 5, agent="codex")
+
+
+@pytest.mark.parametrize("agent", ["claude", "copilot", "codex"])
+def test_print_plan_prompt_names_skill_file_only_for_codex(capsys, agent):
+    assert sd.main(["dispatch", "--root", str(WORKSPACES), "--task", "Summarize sales.csv",
+                    "--agent", agent]) == 0
+    prompt = json.loads(capsys.readouterr().out)["prompt"]
+    if agent == "codex":
+        assert prompt == ("Use the `summarize-csv` skill from this folder for the following task. "
+                          "Its instructions are in `.claude/skills/summarize-csv/SKILL.md`; read "
+                          "that file and follow the skill's steps exactly.\n\nTask: Summarize sales.csv")
+    else:
+        assert prompt == sd.prompt_for("Summarize sales.csv", "summarize-csv")
+        assert "SKILL.md" not in prompt
+
+
+def test_main_sends_the_printed_codex_prompt(monkeypatch, capsys):
+    sent = []
+
+    def dispatch(folder, prompt, *args, **kwargs):
+        sent.append(prompt)
+        return {"backend": "local", "exit": 0}
+
+    monkeypatch.setattr(sd, "dispatch_local", dispatch)
+    assert sd.main(["dispatch", "--root", str(WORKSPACES), "--task", "Summarize sales.csv",
+                    "--backend", "local", "--agent", "codex"]) == 0
+    assert sent == [json.loads(capsys.readouterr().out)["prompt"]]
+    assert ".claude/skills/summarize-csv/SKILL.md" in sent[0]
