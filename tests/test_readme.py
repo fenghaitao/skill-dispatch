@@ -6,13 +6,14 @@ from pathlib import Path
 README = Path(__file__).resolve().parents[1] / "README.md"
 
 
-def test_readme_qualifies_body_reads_and_initial_skill_visibility():
+def test_readme_qualifies_git_identity_and_initial_skill_visibility():
     text = README.read_text()
-    assert "verification intentionally reads skill bodies" in text
+    assert "existing skills need no skill-dispatch-specific instructions" in text
+    assert "repo_commit" in text and "skill_blob" in text
+    assert "many tasks can" in text and "same pinned submodule commit" in text
     assert "A parent-folder session does not initially load" in text
     assert "can subsequently discover nested skills" in text
     assert "https://code.claude.com/docs/en/skills" in text
-    assert "the orchestrator never loads it" not in text
 
 
 def test_readme_documents_permission_opt_ins_receipt_ids_and_print_demo():
