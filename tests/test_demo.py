@@ -1,6 +1,7 @@
 """Demo safety checks; only print mode is allowed to reach dispatch."""
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -18,7 +19,9 @@ def demo_env(tmp_path):
     git_log = tmp_path / "git-calls"
     worker_log = tmp_path / "worker-calls"
     git = binaries / "git"
-    git.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$GIT_CALLS"\n')
+    real_git = shutil.which("git")
+    assert real_git
+    git.write_text(f'#!/usr/bin/env bash\\nprintf "%s\\\\n" "$*" >> "$GIT_CALLS"\\nexec "{real_git}" "$@"\\n')
     git.chmod(0o755)
     for name in ("claude", "orca", "orca-ide", "herdr"):
         worker = binaries / name
@@ -129,7 +132,7 @@ def test_demo_print_copies_hidden_skills_and_skips_verification(tmp_path, demo_e
         assert (scratch / Path(relative).relative_to("workspaces")).read_bytes() == content
     assert sources() == before
     assert not list(scratch.rglob(".skill-receipts"))
-    assert len(Path(demo_env["GIT_CALLS"]).read_text().splitlines()) == 9
+    assert len(Path(demo_env["GIT_CALLS"]).read_text().splitlines()) == 24
 
 
 def test_demo_print_assigns_a_fresh_id_per_run(tmp_path, demo_env):
