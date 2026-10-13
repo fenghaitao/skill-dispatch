@@ -370,3 +370,21 @@ def test_stalled_prompt_gate_fails_without_evidence(tmp_path, monkeypatch, herdr
         sd.dispatch_herdr(tmp_path, 'task', 'worker', None, 5)
     assert sum(a[1] == 'prompt' for a, _ in calls) == 1
     assert clock.now <= sd.HERDR_LATE_ACTIVITY_SECONDS + 1
+
+
+@pytest.mark.parametrize('opt_in', [False, True])
+def test_codex_worker_avoids_daemon_and_update_dialogs_and_never_asks(tmp_path, monkeypatch, herdr_env, opt_in):
+    calls, _ = launch(monkeypatch, tmp_path, kind='codex')
+    result = sd.dispatch_herdr(tmp_path, 'task', 'worker', 'gpt-x', 5, accept_edits=opt_in,
+                               agent='codex')
+    # --no-daemon: a shared-server conflict modal was reported by Herdr as idle and ready.
+    assert list(calls[1][0][9:]) == ['--', '--no-daemon', '--config=check_for_update_on_startup=false',
+                                     '--sandbox', 'workspace-write' if opt_in else 'read-only',
+                                     '--ask-for-approval', 'never', '--model=gpt-x']
+    assert (result['kind'], result['accepted']) == ('codex', True)
+
+
+def test_codex_rejects_tool_rules_before_creating_a_tab(tmp_path, monkeypatch, herdr_env):
+    monkeypatch.setattr(sd, '_herdr', lambda *a, **kw: pytest.fail('created a tab'))
+    with pytest.raises(sd.DispatchError, match='no per-tool approval rules'):
+        sd.dispatch_herdr(tmp_path, 'task', 'worker', None, 5, allow_tools=['Bash'], agent='codex')

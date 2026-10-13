@@ -23,7 +23,7 @@ def demo_env(tmp_path):
     assert real_git
     git.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$GIT_CALLS"\nexec "{real_git}" "$@"\n')
     git.chmod(0o755)
-    for name in ("claude", "copilot", "orca", "orca-ide", "herdr"):
+    for name in ("claude", "copilot", "codex", "orca", "orca-ide", "herdr"):
         worker = binaries / name
         worker.write_text('#!/usr/bin/env bash\necho unexpected-worker >> "$WORKER_CALLS"\nexit 99\n')
         worker.chmod(0o755)
@@ -109,7 +109,7 @@ def test_demo_rejects_invalid_options_before_creating_scratch(tmp_path, demo_env
 
 def test_demo_rejects_invalid_agent_before_creating_scratch(tmp_path, demo_env):
     scratch = tmp_path / "new"
-    result = run_demo({**demo_env, "AGENT": "codex"}, "print", scratch)
+    result = run_demo({**demo_env, "AGENT": "gemini"}, "print", scratch)
     assert result.returncode == 2 and "invalid AGENT" in result.stderr
     assert not scratch.exists() and not Path(demo_env["GIT_CALLS"]).exists()
 

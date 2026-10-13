@@ -72,3 +72,27 @@ worker-written receipts, which the current dispatcher no longer uses.
 
 Folder-trust prompts, and shell commands outside the `--accept-edits` rules,
 were approved by hand in scratch folders; the dispatcher did not answer them.
+
+## OpenAI Codex workers
+
+Checked on 2026-10-13 with Herdr 0.9.3 client / 0.9.1 server (protocol 22),
+Codex CLI 0.160.0 and Python 3.13, after the simplified design.
+
+- Local demo: `AGENT=codex scripts/demo.sh local <scratch> --accept-edits`
+  completed all three tasks. Codex ran the calculator tests inside the
+  `workspace-write` sandbox (2 passed), added the 0.2.0 release note, and
+  produced a CSV report matching the source (4 rows, total 445).
+- Sandbox: under `workspace-write`, a write to the home directory failed with
+  "Read-only file system".
+- Herdr probes: without `--no-daemon`, Codex showed a shared-server settings
+  modal while Herdr reported `idle` with `interactive_ready: true`. With
+  `--no-daemon`, the update dialog and folder-trust prompt were both reported
+  as `blocked`; after trust Codex briefly went `working`, then `done`.
+- Herdr demo: `AGENT=codex scripts/demo.sh herdr <scratch> --accept-edits`
+  dispatched all three tasks with `accepted: true` and `activity_observed:
+  true`. No update dialog appeared, and the artifacts matched the local demo.
+- Trusted folder: a second dispatch into an already-trusted workspace started
+  without prompts, was accepted, and completed the task.
+
+Folder-trust prompts were approved by hand in scratch folders; the dispatcher
+did not answer them.
