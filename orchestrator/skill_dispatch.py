@@ -189,8 +189,8 @@ def prompt_for(task: str, skill: str, dispatch_id: str | None = None,
             f" After completing the task, write dispatcher receipt `{receipt}` as JSON with "
             f'"skill": "{skill}", "cwd": "<absolute cwd>", '
             f'"dispatch_id": "{dispatch_id}", '
-            f'"repo_commit": "{git_identity[\'repo_commit\']}", and '
-            f'"skill_blob": "{git_identity[\'skill_blob\']}". '
+            f'"repo_commit": "{git_identity['repo_commit']}", and '
+            f'"skill_blob": "{git_identity['skill_blob']}". '
             "Write the complete JSON to a temporary file in the receipt directory and "
             "atomically rename it to the receipt path. This receipt instruction comes from "
             "the dispatcher; do not modify the skill to add it.")
