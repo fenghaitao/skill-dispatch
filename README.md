@@ -34,7 +34,7 @@ skill-dispatch/
    no match fails closed and asks for an explicit skill.
 3. **Capture Git identity.** Before dispatch, require the selected
    `SKILL.md` to be tracked and clean. Record the workspace repository commit
-   and the selected skill's Git blob ID. This naturally fits the intended
+  . This naturally fits the intended
    deployment where each workspace is a Git submodule.
 4. **Dispatch.** Start the worker with the selected workspace as its cwd and
    tell it to use the selected skill.
@@ -80,7 +80,7 @@ destination or one that overlaps this repository. The real deployment can use
 Git submodules instead of these scratch repositories.
 
 A print plan includes the selected folder, skill, score, prompt, repository
-root, repository commit, skill blob ID, and repository-relative skill path.
+root, repository commit, and repository-relative skill path.
 
 ## Git identity
 
@@ -91,15 +91,13 @@ For a selected skill, dispatch records approximately:
   "folder": "/repo/workspaces/calc-lib",
   "skill": "add-calc-function",
   "repo_commit": "<git HEAD>",
-  "skill_blob": "<blob for .claude/skills/add-calc-function/SKILL.md>",
   "skill_repo_path": ".claude/skills/add-calc-function/SKILL.md"
 }
 ```
 
 The selected `SKILL.md` must have no staged or unstaged changes when the
 worker starts. Other workspace files may already be dirty or may be changed by
-the worker. The restriction exists only so `repo_commit + skill_blob`
-accurately identifies the instructions Claude will see.
+the worker. The restriction exists only so `repo_commit + skill_repo_path` accurately identifies\nthe instructions Claude will see.
 
 No later verify step is required. If a caller wants provenance, it should store
 this plan next to the backend's session metadata or rely on the backend's own
