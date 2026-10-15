@@ -67,10 +67,14 @@ def test_copilot_rejects_claude_rules_before_starting(monkeypatch, rule):
         sd.dispatch_local(Path("."), "task", None, allow_tools=[rule], agent="copilot")
 
 
-def test_orca_rejects_copilot_before_contacting_orca(monkeypatch, tmp_path):
+@pytest.mark.parametrize("agent, rules, message", [
+    ("copilot", ["Bash(python3 -m pytest -q)"], "Claude tool rule"),
+    ("codex", ["shell(python3)"], "no per-tool approval rules"),
+])
+def test_orca_rejects_foreign_rules_before_contacting_orca(monkeypatch, tmp_path, agent, rules, message):
     monkeypatch.setattr(sd, "_orca", lambda *a, **kw: pytest.fail("contacted Orca"))
-    with pytest.raises(sd.DispatchError, match="only --agent claude"):
-        sd.dispatch_orca(tmp_path, "task", "worker", None, 5, agent="copilot")
+    with pytest.raises(sd.DispatchError, match=message):
+        sd.dispatch_orca(tmp_path, "task", "worker", None, 5, allow_tools=rules, agent=agent)
 
 
 def test_main_rejects_unknown_agent(capsys):
@@ -184,12 +188,13 @@ def test_orca_waits_through_trust_without_answering_then_sends_once(tmp_path, mo
     result = sd.dispatch_orca(tmp_path, prompt, "alpha worker", model, 5,
                               accept_edits=opt_in, allow_tools=["Bash(python3 -m pytest -q)"] if opt_in else [])
     command = calls[0][0][-1]
-    assert shlex.split(command) == ["claude", "--permission-mode",
+    assert shlex.split(command) == ["command", "claude", "--permission-mode",
                                    "acceptEdits" if opt_in else "dontAsk",
                                    *(["--allowedTools=Bash(python3 -m pytest -q)"] if opt_in else []),
                                    f"--model={model}"]
-    assert [args[:2] for args, _ in calls] == [("terminal", "create"), ("terminal", "wait"),
-                                              ("terminal", "wait"), ("terminal", "send")]
+    steps = [args[:2] for args, _ in calls]
+    assert steps[:3] == [("terminal", "create"), ("terminal", "wait"), ("terminal", "wait")]
+    assert steps[-1] == ("terminal", "send") and steps.count(("terminal", "send")) == 1
     assert result["accepted"] is True and result["send"] == receipt
     assert result["warnings"] == ["turn start unproven"]
     assert "agent-cwd-prompt" in capsys.readouterr().err
@@ -377,10 +382,117 @@ def test_codex_rejects_tool_rules_before_starting(monkeypatch):
         sd.dispatch_local(Path("."), "task", None, allow_tools=["shell(python3)"], agent="codex")
 
 
-def test_orca_rejects_codex_before_contacting_orca(monkeypatch, tmp_path):
-    monkeypatch.setattr(sd, "_orca", lambda *a, **kw: pytest.fail("contacted Orca"))
-    with pytest.raises(sd.DispatchError, match="only --agent claude"):
-        sd.dispatch_orca(tmp_path, "task", "worker", None, 5, agent="codex")
+@pytest.mark.parametrize("agent, accept_edits, rules, expected", [
+    ("copilot", False, ["shell(python3)"],
+     ["copilot", "--no-ask-user", "--allow-tool=shell(python3)", "--model=m"]),
+    ("copilot", True, [],
+     ["copilot", "--no-ask-user", "--allow-tool=write", "--allow-tool=shell(mkdir)",
+      "--allow-tool=shell(mv)", "--model=m"]),
+    ("codex", False, [],
+     ["codex", "--no-daemon", "--config=check_for_update_on_startup=false",
+      "--sandbox", "read-only", "--ask-for-approval", "never", "--model=m"]),
+    ("codex", True, [],
+     ["codex", "--no-daemon", "--config=check_for_update_on_startup=false",
+      "--sandbox", "workspace-write", "--ask-for-approval", "never", "--model=m"]),
+])
+def test_orca_starts_copilot_and_codex_past_shell_aliases(tmp_path, monkeypatch, capsys,
+                                                         agent, accept_edits, rules, expected):
+    def handler(args, kwargs, clock):
+        if args[:2] == ("terminal", "wait"):
+            return {"wait": {"satisfied": True}}
+        return {"send": {"accepted": True}}
+
+    _, calls = mock_orca_launch(monkeypatch, tmp_path, handler)
+    result = sd.dispatch_orca(tmp_path, "task", "worker", "m", 30, accept_edits=accept_edits,
+                              allow_tools=rules, agent=agent)
+    # `command` makes the shell skip an alias such as copilot='copilot --allow-all'.
+    assert shlex.split(calls[0][0][-1]) == ["command", *expected]
+    assert result["accepted"] is True
+
+
+def test_orca_requires_readiness_to_hold_before_sending(tmp_path, monkeypatch, capsys):
+    """Copilot was reported idle, then drew its trust dialog; Enter would answer it."""
+    observations = iter([{"satisfied": True}, {"satisfied": True},
+                         {"satisfied": False, "blockedReason": "agent-trust-workspace"}])
+    sent_at = []
+
+    def handler(args, kwargs, clock):
+        if args[:2] == ("terminal", "wait"):
+            return {"wait": next(observations, {"satisfied": True})}
+        sent_at.append(clock.now)
+        return {"send": {"accepted": True}}
+
+    clock, calls = mock_orca_launch(monkeypatch, tmp_path, handler)
+    assert sd.dispatch_orca(tmp_path, "task", "worker", None, 30, agent="copilot")["accepted"]
+    waits = [args for args, _ in calls if args[:2] == ("terminal", "wait")]
+    assert len(sent_at) == 1 and len(waits) > 3
+    # The hold restarts after the blocked observation, so the send comes later than the hold.
+    assert sent_at[0] >= sd.ORCA_READY_HOLD_SECONDS + 0.5
+    assert "agent-trust-workspace" in capsys.readouterr().err
+
+
+def test_orca_hold_restarts_after_a_wait_that_blocked_until_idle(tmp_path, monkeypatch):
+    """A busy period between two idle observations does not count as held readiness."""
+    waits = 0
+    sent_at = []
+
+    def handler(args, kwargs, clock):
+        nonlocal waits
+        if args[:2] == ("terminal", "wait"):
+            waits += 1
+            if waits == 2:
+                clock.now += 10  # the worker was busy; Orca returned once it was idle again
+            return {"wait": {"satisfied": True}}
+        sent_at.append(clock.now)
+        return {"send": {"accepted": True}}
+
+    mock_orca_launch(monkeypatch, tmp_path, handler)
+    assert sd.dispatch_orca(tmp_path, "task", "worker", None, 60, agent="copilot")["accepted"]
+    assert sent_at[0] >= 10 + sd.ORCA_READY_HOLD_SECONDS
+
+
+def test_orca_readiness_that_never_holds_sends_nothing(tmp_path, monkeypatch, capsys):
+    flip = iter(range(1000))
+
+    def handler(args, kwargs, clock):
+        assert args[:2] == ("terminal", "wait"), "sent a task to a worker that never held ready"
+        if next(flip) % 2:
+            return {"wait": {"satisfied": False, "blockedReason": "agent-trust-workspace"}}
+        return {"wait": {"satisfied": True}}
+
+    mock_orca_launch(monkeypatch, tmp_path, handler)
+    with pytest.raises(sd.DispatchError, match="blocked on agent-trust-workspace"):
+        sd.dispatch_orca(tmp_path, "task", "worker", None, 10, agent="copilot")
+    capsys.readouterr()
+
+
+def test_orca_wait_timeout_error_is_an_unsatisfied_observation(monkeypatch):
+    payload = {"ok": False, "error": {"code": "timeout", "message": "timeout"}}
+    monkeypatch.setattr(sd, "_run", lambda argv, **kw:
+                        subprocess.CompletedProcess(argv, 1, json.dumps(payload), ""))
+    assert sd._orca("terminal", "wait", timeout=1) == {"wait": {"satisfied": False}}
+    with pytest.raises(sd.DispatchError, match="timeout"):
+        sd._orca("terminal", "send")
+    other = {"ok": False, "error": {"code": "terminal_handle_stale"}}
+    monkeypatch.setattr(sd, "_run", lambda argv, **kw:
+                        subprocess.CompletedProcess(argv, 1, json.dumps(other), ""))
+    with pytest.raises(sd.DispatchError, match="terminal_handle_stale"):
+        sd._orca("terminal", "wait", timeout=1)
+
+
+def test_orca_keeps_waiting_while_a_worker_is_still_starting(tmp_path, monkeypatch):
+    starting = iter([True, True])
+
+    def handler(args, kwargs, clock):
+        if args[:2] == ("terminal", "wait"):
+            if next(starting, False):
+                clock.now += int(args[-1]) / 1000
+                return {"wait": {"satisfied": False}}
+            return {"wait": {"satisfied": True}}
+        return {"send": {"accepted": True}}
+
+    mock_orca_launch(monkeypatch, tmp_path, handler)
+    assert sd.dispatch_orca(tmp_path, "task", "worker", None, 120, agent="codex")["accepted"]
 
 
 @pytest.mark.parametrize("agent", ["claude", "copilot", "codex"])

@@ -127,8 +127,7 @@ tests, builds, generated artifacts, human review, or other acceptance checks.
 Each backend starts a worker CLI chosen with `--agent`: Claude Code (default),
 GitHub Copilot CLI, which also reads `.claude/skills`, or OpenAI Codex CLI, which
 does not. A Codex worker's prompt therefore names the selected skill file, a
-path known from discovery. Copilot and Codex are supported by the local and
-Herdr backends.
+path known from discovery. Every agent is supported by every backend.
 
 ### print
 
@@ -141,8 +140,10 @@ the lifecycle result.
 
 ### Orca
 
-Create/use the workspace worktree, start Claude in an Orca terminal, wait for
-interactive readiness, then send the task. Do not answer trust prompts.
+Create/use the workspace worktree, start the worker in an Orca terminal as
+`command <agent> ...` (so a shell alias or function cannot widen its options),
+wait until Orca has reported it idle and unblocked for 3 seconds in a row, then
+send the task. Do not answer trust prompts.
 
 The returned terminal handle is the execution identity.
 

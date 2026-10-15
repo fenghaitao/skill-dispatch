@@ -15,7 +15,7 @@ skill locally. Execution lifecycle and history belong to the backend session.
 Backends:
   print  show the plan only;
   local  run `claude -p` as a subprocess with the folder as its working directory;
-  orca   open an Orca terminal in the folder, start `claude` there and send the task.
+  orca   open an Orca terminal in the folder, start the worker there and send the task.
          A trust prompt for a new folder is left to a person; the dispatcher
          names the waiting tab and sends the task once the agent is ready.
   herdr  open a background tab in the caller's Herdr workspace and start the worker
@@ -23,7 +23,7 @@ Backends:
 
 Agents: `claude` (Claude Code, the default), `copilot` (GitHub Copilot CLI, which
 also loads `.claude/skills`) or `codex` (OpenAI Codex CLI, which is told the skill
-file's path). Copilot and Codex work with the local and herdr backends.
+file's path). Every agent works with every backend.
 
 Existing skills are never modified and no receipt protocol is injected into
 their tasks. Git identifies the code/skill snapshot; the local process or the
@@ -49,6 +49,11 @@ SKILL_GLOB = ".claude/skills/*/SKILL.md"
 MAX_FRONTMATTER_BYTES = 16 * 1024
 SKILL_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 ORCA_WAIT_MARGIN_SECONDS = 5
+# Orca can report Copilot idle before its folder-trust dialog is drawn; an Enter
+# sent then would answer the dialog. Readiness must hold this long first.
+ORCA_READY_HOLD_SECONDS = 3
+# A satisfied wait that took longer than this was not idle when it started.
+ORCA_IDLE_PROBE_SECONDS = 1
 HERDR_LATE_ACTIVITY_SECONDS = 60
 AGENTS = ("claude", "copilot", "codex")
 # --accept-edits for Copilot: file writes plus common move/mkdir commands, like acceptEdits.
@@ -234,6 +239,11 @@ def _orca(*args: str, timeout: float = 30) -> dict:
                             f"{result.stderr.strip() or result.stdout.strip()}") from exc
     if not isinstance(payload, dict) or payload.get("ok") is not True:
         error = payload.get("error") if isinstance(payload, dict) else "invalid response"
+        # A wait for a worker that is neither idle nor blocked yet (e.g. still
+        # starting) ends with a timeout error rather than an unsatisfied result.
+        if (args[:2] == ("terminal", "wait") and result.returncode == 1
+                and isinstance(error, dict) and error.get("code") == "timeout"):
+            return {"wait": {"satisfied": False}}
         raise DispatchError(f"orca {' '.join(args[:2])}: {error}")
     value = payload.get("result")
     if not isinstance(value, dict):
@@ -335,24 +345,25 @@ def seconds_argument(value: str) -> float:
 def dispatch_orca(folder: Path, prompt: str, title: str, model: str | None,
                   ready_seconds: float = 600, *, accept_edits: bool = False,
                   allow_tools: list[str] | None = None, agent: str = "claude") -> dict:
-    if agent != "claude":
-        raise DispatchError("the orca backend supports only --agent claude")
     validate_seconds(ready_seconds)
     if ready_seconds < 0.001:
         raise DispatchError("readiness budget expired; task not sent")
-    command = shlex.join(["claude", *agent_args("claude", model, accept_edits=accept_edits,
-                                                allow_tools=allow_tools)])
+    # Orca types the command into the user's shell. `command` skips shell
+    # aliases and functions, such as `alias copilot='copilot --allow-all'`.
+    command = shlex.join(["command", agent, *agent_args(agent, model, accept_edits=accept_edits,
+                                                        allow_tools=allow_tools)])
     worktree = orca_worktree(folder)
     terminal = _orca("terminal", "create", "--worktree", f"id:{worktree}",
                      "--title", title, "--command", command)["terminal"]["handle"]
-    # A folder Claude Code has not been told to trust opens with a trust
+    # A folder the agent has not been told to trust opens with a trust
     # prompt. That is a person's decision, so the dispatcher never answers it:
     # it says which tab is waiting and keeps waiting for the agent to be ready.
     deadline = time.monotonic() + ready_seconds
     noticed = None
+    ready_since = None
 
     def readiness_error() -> DispatchError:
-        return DispatchError(f"claude in {terminal} did not become ready"
+        return DispatchError(f"{agent} in {terminal} did not become ready"
                              f"{f' (blocked on {noticed})' if noticed else ''}; task not sent")
 
     while True:
@@ -360,6 +371,7 @@ def dispatch_orca(folder: Path, prompt: str, title: str, model: str | None,
         if remaining < 0.001:
             raise readiness_error()
         wait_ms = min(30000, int(remaining * 1000))
+        asked = time.monotonic()
         try:
             # Let Orca finish its wait and return the blocked reason before
             # subprocess.run kills it. The margin never extends eligibility
@@ -377,9 +389,17 @@ def dispatch_orca(folder: Path, prompt: str, title: str, model: str | None,
             noticed = reason
         if time.monotonic() >= deadline:
             raise readiness_error()
-        if wait.get("satisfied") is True:
-            break
-        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        if wait.get("satisfied") is True and not reason:
+            # A wait that blocked until idle means the worker was busy in
+            # between, so the hold restarts from this new idle.
+            if ready_since is None or time.monotonic() - asked > ORCA_IDLE_PROBE_SECONDS:
+                ready_since = time.monotonic()
+            if time.monotonic() - ready_since >= ORCA_READY_HOLD_SECONDS:
+                break
+        else:
+            ready_since = None
+        time.sleep(min(0.5 if ready_since is not None else 0.1,
+                       max(0, deadline - time.monotonic())))
     if time.monotonic() >= deadline:
         raise readiness_error()
     sent = _orca("terminal", "send", "--terminal", terminal, "--text", prompt, "--enter")
@@ -579,8 +599,7 @@ def main(argv: list[str] | None = None) -> int:
         if name == "dispatch":
             p.add_argument("--backend", choices=("print", "local", "orca", "herdr"), default="print")
             p.add_argument("--agent", choices=AGENTS, default="claude",
-                           help="worker CLI: Claude Code, GitHub Copilot CLI or OpenAI Codex "
-                                "CLI (Copilot and Codex: local/herdr)")
+                           help="worker CLI: Claude Code, GitHub Copilot CLI or OpenAI Codex CLI")
             p.add_argument("--model")
             p.add_argument("--accept-edits", action="store_true",
                            help="opt in to automatic approval of in-scope edits")

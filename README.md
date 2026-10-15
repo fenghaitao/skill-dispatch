@@ -40,15 +40,14 @@ skill-dispatch/
    tell it to use the selected skill.
    - `print`: show the plan only;
    - `local`: run `claude -p` synchronously;
-   - `orca`: create an Orca terminal, wait for Claude readiness, then send the task;
+   - `orca`: create an Orca terminal, wait for the worker's sustained readiness,
+     then send the task;
    - `herdr`: create a background tab, start a named agent, wait for
      readiness, then submit the task.
 
    `--agent` picks the worker CLI: `claude` (Claude Code, the default),
-   `copilot` (GitHub Copilot CLI) or `codex` (OpenAI Codex CLI). Copilot and
-   Codex work with the `local` and `herdr` backends; see
-   [GitHub Copilot workers](#github-copilot-workers) and
-   [OpenAI Codex workers](#openai-codex-workers).
+   `copilot` (GitHub Copilot CLI) or `codex` (OpenAI Codex CLI). Every agent
+   works with every backend; see [Workers](#workers).
 
 There is no dispatcher receipt, synthetic run ID, or verify command. Execution
 state and history belong to the backend session/process. Git identity answers
@@ -78,9 +77,12 @@ scripts/demo.sh herdr /tmp/sd-herdr --accept-edits \
   --allow-tool 'Bash(python3 -m pytest -q)'
 AGENT=copilot scripts/demo.sh local /tmp/sd-copilot --accept-edits \
   --allow-tool 'shell(python3)'
+AGENT=copilot scripts/demo.sh orca /tmp/sd-copilot-orca --accept-edits \
+  --allow-tool 'shell(python3)'
 AGENT=copilot scripts/demo.sh herdr /tmp/sd-copilot-herdr --accept-edits \
   --allow-tool 'shell(python3)'
 AGENT=codex scripts/demo.sh local /tmp/sd-codex --accept-edits
+AGENT=codex scripts/demo.sh orca /tmp/sd-codex-orca --accept-edits
 AGENT=codex scripts/demo.sh herdr /tmp/sd-codex-herdr --accept-edits
 
 uv run pytest -q tests
@@ -158,6 +160,42 @@ workspace, tab, pane and named agent. Herdr also requires observed activity
 after prompt submission, which confirms that the backend accepted and started
 processing the turn; it is not a claim that the requested task is correct.
 
+## Orca launch and readiness
+
+Run the Orca backend from an Orca-managed terminal, where the `orca` CLI is on
+`PATH`. Dispatch registers the workspace folder as an Orca repository if needed,
+creates a terminal in its worktree and starts the worker there:
+
+```bash
+python3 orchestrator/skill_dispatch.py dispatch --root workspaces \
+  --task "Summarize sales.csv" --backend orca --agent copilot \
+  --accept-edits --allow-tool 'shell(python3)' --ready 120
+```
+
+Orca types the worker command into the terminal's login shell, so a shell alias
+or function could add options, for example
+`alias copilot='copilot --autopilot --allow-all'`. Dispatch therefore starts the
+worker as `command copilot ...` (likewise for `claude` and `codex`); `command`
+makes the shell skip aliases and functions. It does not skip a wrapper script
+earlier on `PATH`, and Orca has no equivalent of Herdr's process-info check, so
+such a wrapper is not detected. `command` assumes a POSIX-style shell such as
+bash, zsh or fish; it was validated with bash on Linux.
+
+Dispatch sends the task only after `orca terminal wait --for tui-idle` has
+reported the worker idle, and not blocked, for 3 seconds in a row; a wait that
+had to block before reporting idle restarts that period. Orca once reported
+Copilot idle before Copilot drew its folder-trust dialog, whose default answer
+is "Yes"; an Enter sent at that moment would have answered the dialog. While a
+worker is blocked, for example on `agent-trust-workspace`, the dispatcher names
+the tab and keeps waiting. A wait that times out because the worker is not
+ready counts as "not ready yet", not as an error. A worker that exits before it
+becomes ready, for example after "No, exit" in Claude's trust dialog, therefore
+makes dispatch wait until `--ready` expires; the task is not sent.
+
+Orca's send receipt reports `accepted: true` once the input is accepted. It
+does not prove that the turn started, and for Copilot Orca reports that it
+cannot observe delivery. Inspect the terminal before retrying.
+
 Run the Herdr backend from a Herdr-managed terminal with `HERDR_ENV=1` and
 `HERDR_WORKSPACE_ID` available, plus the worker CLI (`claude`, `copilot` or `codex`):
 
@@ -194,20 +232,23 @@ with conservative permissions, and the dispatcher never answers its prompts.
 | Agent | `local` | `orca` | `herdr` | Finds `.claude/skills/` itself |
 | --- | --- | --- | --- | --- |
 | `claude` (default) | yes | yes | yes | yes |
-| `copilot` | yes | no | yes | yes |
-| `codex` | yes | no | yes | no; the prompt names the skill file |
+| `copilot` | yes | yes | yes | yes |
+| `codex` | yes | yes | yes | no; the prompt names the skill file |
+
+Live runs are recorded in [docs/herdr-validation.md](docs/herdr-validation.md)
+and [docs/orca-validation.md](docs/orca-validation.md).
 
 ## Claude Code workers
 
 `--agent claude` is the default and starts
 [Claude Code](https://code.claude.com/docs). Claude discovers the workspace's
 `.claude/skills/` from its working directory; see
-[Skill visibility](#skill-visibility). It is the only worker supported by every
-backend.
+[Skill visibility](#skill-visibility).
 
 - `local` runs `claude -p PROMPT` in the folder with stdin disabled.
-- `orca` starts `claude` in an Orca terminal, waits for Orca to report the TUI
-  idle, then sends the task.
+- `orca` starts `command claude` in an Orca terminal, waits for sustained
+  readiness, then sends the task; see
+  [Orca launch and readiness](#orca-launch-and-readiness).
 - `herdr` starts the worker with `herdr agent start --kind claude` and then
   follows the readiness, launch-check and submission steps above.
 
@@ -222,7 +263,13 @@ Permission options map directly to Claude Code flags:
 Rules use Claude's syntax, such as `Bash(python3 -m pytest -q)` or `Edit`.
 Use `--model` to pick a Claude model. Permission rules in Claude's own settings
 files still apply. The dispatcher controls only Claude's command line, and the
-Herdr launch check cannot see those settings.
+Herdr launch check cannot see those settings. In one live Orca run with
+`permissions.defaultMode: "auto"` in `~/.claude/settings.json`, a worker started
+with `acceptEdits` was recorded in auto mode after its first command that
+`acceptEdits` did not allow; no input was sent to it.
+
+Claude Code 2.1.300's folder-trust dialog selects "No, exit" by default, so an
+Enter alone declines it.
 
 ## GitHub Copilot workers
 
@@ -232,9 +279,11 @@ as well as `.github/skills/`, so the workspaces need no changes. Copilot must be
 installed and signed in (`copilot login`).
 
 - `local` runs `copilot -p PROMPT -s` in the folder with stdin disabled.
+- `orca` starts `command copilot` in an Orca terminal and follows the same
+  readiness steps as Claude. Its folder-trust dialog selects "Yes" by default,
+  which is why Orca readiness must hold before the task is sent.
 - `herdr` starts the worker with `herdr agent start --kind copilot` and then
   follows the same readiness, launch-check and submission steps as Claude.
-- `orca` rejects `--agent copilot` for now.
 
 Every Copilot worker gets `--no-ask-user` and no blanket approvals: under `-p`,
 Copilot denies writes and commands that no rule allows, and an interactive
@@ -258,8 +307,13 @@ Copilot matches shell rules on the command name, not the full command line:
 
 The dispatcher controls only Copilot's command line. The `COPILOT_ALLOW_ALL`
 environment variable and the `defaultPermissionMode` and `defaultMode` settings
-in `~/.copilot/settings.json` can still widen approvals, and the Herdr launch
-check cannot see them. Leave them unset for conservative workers.
+in `~/.copilot/settings.json` can still widen approvals, and neither the Orca
+`command` prefix nor the Herdr launch check can see them. Leave them unset for
+conservative workers.
+
+Orca reported a Copilot worker idle while Copilot was waiting on a command
+approval prompt, so on Orca an idle Copilot terminal does not mean the task
+finished.
 
 ## OpenAI Codex workers
 
@@ -273,13 +327,15 @@ The printed plan shows the exact prompt. Codex must be installed and signed in
 
 - `local` runs `codex exec --sandbox MODE -- PROMPT`; `codex exec` never asks
   for approval.
-- `herdr` starts the worker with `herdr agent start --kind codex` and adds
-  `--ask-for-approval never`, so Codex returns failures to the model instead of
-  prompting. It also adds `--no-daemon` and
-  `--config=check_for_update_on_startup=false`: with a conflicting shared Codex
-  server, Codex showed a settings modal that Herdr reported as idle and ready,
-  and the update dialog's default option runs an installer.
-- `orca` rejects `--agent codex` for now.
+- `orca` and `herdr` start an interactive worker with `--ask-for-approval
+  never`, so Codex returns failures to the model instead of prompting. They also
+  add `--no-daemon` and `--config=check_for_update_on_startup=false`: with a
+  conflicting shared Codex server, Codex showed a settings modal that Herdr
+  reported as idle and ready, and the update dialog's default option runs an
+  installer.
+- `orca` starts `command codex ...` in an Orca terminal and follows the same
+  readiness steps as Claude.
+- `herdr` starts the worker with `herdr agent start --kind codex`.
 
 Codex permissions are a sandbox mode rather than per-tool rules. The sandbox is
 always passed explicitly, so `~/.codex/config.toml` or a profile cannot pick it:
@@ -299,8 +355,8 @@ confined: in a live check, writing to the home directory failed with
 The dispatcher controls only Codex's command line. Execpolicy `.rules` files
 (for example in `~/.codex/rules`) and other Codex configuration can still
 change what runs, and the Herdr launch check cannot see them. Codex readiness
-relies on Herdr's detection, which misreported one modal as ready before
-`--no-daemon` was added.
+relies on Orca's or Herdr's detection; Herdr misreported one modal as ready
+before `--no-daemon` was added.
 
 Codex asks whether to trust each new folder and saves the answer in
 `~/.codex/config.toml`. The dispatcher never answers that prompt.
@@ -319,7 +375,8 @@ isolation boundary.
 ## Tests
 
 The test suite covers frontmatter safety, routing, Git identity, permission
-arguments for Claude, Copilot and Codex, Orca/Herdr readiness and trust behavior,
+arguments for Claude, Copilot and Codex, Orca/Herdr readiness and trust behavior
+(including Orca's sustained-readiness rule and alias-skipping launch command),
 the Herdr launch check, backend acknowledgements, and the demo's
 scratch-repository safety. Backend tests use mocks; they do not prove that a
 live Claude/Copilot/Codex/Orca/Herdr installation will complete a task correctly.
